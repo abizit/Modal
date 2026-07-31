@@ -22,14 +22,15 @@
       .studio { display:grid; grid-template-columns:1fr 1fr; border:1px solid var(--ink); background:#f7f6ef; }
       .controls { padding:28px; border-right:1px solid var(--ink); }
       .result { min-height:510px; display:flex; padding:20px; background:#dfe0d5; align-items:center; justify-content:center; }
-      .mode { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin:18px 0 28px; }
+      .mode { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; margin:18px 0 28px; }
       .mode button { appearance:none; text-align:left; cursor:pointer; padding:14px; border:1px solid var(--line); background:transparent; font:500 12px "DM Mono",monospace; text-transform:uppercase; }
       .mode button.active { background:var(--ink); color:var(--paper); border-color:var(--ink); }
       label { display:block; margin-bottom:8px; font:500 11px "DM Mono",monospace; letter-spacing:.06em; text-transform:uppercase; }
-      .drop { position:relative; height:180px; display:grid; place-items:center; border:1px dashed #898d82; cursor:pointer; background:#eeeee7; overflow:hidden; margin-bottom:24px; }
-      .drop:hover { border-color:var(--ink); } .drop img { width:100%; height:100%; object-fit:cover; } .drop span { color:var(--muted); font-size:13px; }
+      .drop { position:relative; height:220px; display:flex; align-items:center; justify-content:center; border:1px dashed #898d82; cursor:pointer; background:#eeeee7; overflow:hidden; margin-bottom:24px; }
+      .drop:hover { border-color:var(--ink); } .drop img { display:block; width:auto; height:auto; max-width:100%; max-height:100%; object-fit:contain; background:#d9d9d1; } .drop span { color:var(--muted); font-size:13px; } .drop [hidden] { display:none; }
       input[type=file] { position:absolute; inset:0; opacity:0; cursor:pointer; }
-      textarea { width:100%; min-height:130px; resize:vertical; padding:14px; border:1px solid var(--line); background:#fffef9; font:15px/1.5 Manrope,sans-serif; color:var(--ink); }
+      textarea { width:100%; min-height:112px; resize:vertical; padding:14px; border:1px solid var(--line); background:#fffef9; font:15px/1.5 Manrope,sans-serif; color:var(--ink); }
+      .options { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:24px; } select { width:100%; appearance:none; padding:12px 34px 12px 12px; border:1px solid var(--line); border-radius:0; background:#fffef9 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='m1 1 5 5 5-5' fill='none' stroke='%2320221e' stroke-width='1.5'/%3E%3C/svg%3E") right 12px center/12px no-repeat; font:12px "DM Mono",monospace; }
       textarea:focus { outline:2px solid var(--acid); outline-offset:1px; }
       .submit { display:flex; justify-content:space-between; width:100%; cursor:pointer; margin-top:24px; padding:16px 18px; border:1px solid var(--ink); background:var(--acid); color:var(--ink); font:600 12px "DM Mono",monospace; letter-spacing:.05em; text-transform:uppercase; }
       .submit:hover { background:var(--ink); color:var(--acid); } .submit:disabled { cursor:wait; opacity:.6; }
@@ -42,17 +43,20 @@
   </head>
   <body>
     <main>
-      <header><span class="wordmark">Motion &amp; Kontext / 01</span><span class="stamp">M</span></header>
+      <header><span class="wordmark">Motion &amp; Kontext / 01</span><form action="/logout" method="post"><button class="stamp" title="Sign out" style="cursor:pointer" type="submit">×</button></form></header>
       <h1>Make a <i>change.</i><br />Then make it move.</h1>
       <p class="intro">Edit an image with FLUX.1 Kontext or turn it into a short cinematic motion study with Wan2.2. One source image, one clear instruction.</p>
       <section class="studio">
         <form class="controls" id="form">
           <span class="eyebrow">Choose an engine</span>
-          <div class="mode"><button type="button" class="active" data-mode="image">01 / Edit image</button><button type="button" data-mode="video">02 / Animate image</button></div>
+          <div class="mode"><button type="button" class="active" data-mode="kontext">01 / Kontext</button><button type="button" data-mode="qwen">02 / Qwen identity</button><button type="button" data-mode="video">03 / Animate</button></div>
           <label for="file">Source image</label>
-          <div class="drop" id="drop"><span id="dropText">Drop an image or click to browse</span><input id="file" type="file" accept="image/jpeg,image/png,image/webp" required /></div>
+          <div class="drop" id="drop"><span id="dropText">Drop an image or click to browse</span><img id="preview" alt="Selected source image" hidden /><input id="file" type="file" accept="image/jpeg,image/png,image/webp" required /></div>
           <label for="prompt">Your instruction</label>
           <textarea id="prompt" placeholder="e.g. Turn the daylight scene into a rain-soaked midnight street" required></textarea>
+          <label for="negative" style="margin-top:20px">Avoid <span style="color:var(--muted);text-transform:none;letter-spacing:0">(optional)</span></label>
+          <textarea id="negative" placeholder="e.g. blurry, distorted face, extra fingers, watermark"></textarea>
+          <div class="options" style="margin-top:20px"><div><label for="aspect">Output ratio</label><select id="aspect"><option value="source">Match source</option><option value="1:1">1:1 — Square</option><option value="2:3">2:3 — Portrait</option><option value="3:2">3:2 — Landscape</option><option value="9:16">9:16 — Vertical</option><option value="16:9">16:9 — Widescreen</option></select></div><div><label for="quality">Render quality</label><select id="quality"><option value="draft">Draft — quickest</option><option value="standard" selected>Standard — balanced</option><option value="high">High — slower</option></select></div></div>
           <button class="submit" id="submit" type="submit"><span id="submitText">Create image</span><span>↗</span></button>
           <div class="status" id="status"></div>
         </form>
@@ -61,11 +65,11 @@
       <footer><span>FLUX.1 Kontext [dev] · Wan2.2 TI2V-5B</span><span>Output is generated on Modal</span></footer>
     </main>
     <script>
-      const form=document.querySelector('#form'), file=document.querySelector('#file'), drop=document.querySelector('#drop'), dropText=document.querySelector('#dropText'), prompt=document.querySelector('#prompt'), result=document.querySelector('#result'), status=document.querySelector('#status'), submit=document.querySelector('#submit'), submitText=document.querySelector('#submitText');
-      let mode='image', previewUrl, resultUrl;
-      document.querySelectorAll('[data-mode]').forEach(button=>button.addEventListener('click',()=>{mode=button.dataset.mode;document.querySelectorAll('[data-mode]').forEach(b=>b.classList.toggle('active',b===button));submitText.textContent=mode==='image'?'Create image':'Create video';prompt.placeholder=mode==='image'?'e.g. Make the suit a deep emerald velvet':'e.g. Slow dolly in as wind moves through the scene';}));
-      file.addEventListener('change',()=>{const selected=file.files[0];if(!selected)return;if(previewUrl)URL.revokeObjectURL(previewUrl);previewUrl=URL.createObjectURL(selected);drop.innerHTML='<img alt="Selected source image" src="'+previewUrl+'">';drop.append(file);});
-      form.addEventListener('submit',async event=>{event.preventDefault();if(!file.files[0])return;submit.disabled=true;status.textContent=mode==='image'?'Editing image…':'Generating video — this can take several minutes…';try{const data=new FormData();data.append('image',file.files[0]);data.append('prompt',prompt.value);data.append('mode',mode);const response=await fetch('/api/generate',{method:'POST',body:data});if(!response.ok){const detail=await response.json().catch(()=>({}));throw new Error(detail.detail||'Generation failed.');}const blob=await response.blob();if(resultUrl)URL.revokeObjectURL(resultUrl);resultUrl=URL.createObjectURL(blob);const name=mode==='image'?'kontext-result.png':'wan22-result.mp4';const tag=mode==='image'?'<img class="media" alt="Generated image" src="'+resultUrl+'">':'<video class="media" controls autoplay loop src="'+resultUrl+'"></video>';result.innerHTML=tag+'<a class="download" href="'+resultUrl+'" download="'+name+'">Download ↘</a>';status.textContent='Complete.';}catch(error){status.textContent=error.message;}finally{submit.disabled=false;}});
+      const form=document.querySelector('#form'), file=document.querySelector('#file'), dropText=document.querySelector('#dropText'), preview=document.querySelector('#preview'), prompt=document.querySelector('#prompt'), negative=document.querySelector('#negative'), aspect=document.querySelector('#aspect'), quality=document.querySelector('#quality'), result=document.querySelector('#result'), status=document.querySelector('#status'), submit=document.querySelector('#submit'), submitText=document.querySelector('#submitText');
+      let mode='kontext', previewUrl, resultUrl;
+      document.querySelectorAll('[data-mode]').forEach(button=>button.addEventListener('click',()=>{mode=button.dataset.mode;document.querySelectorAll('[data-mode]').forEach(b=>b.classList.toggle('active',b===button));submitText.textContent=mode==='video'?'Create video':'Create image';prompt.placeholder=mode==='video'?'e.g. Slow dolly in as wind moves through the scene':mode==='qwen'?'e.g. Restage this person at an editorial beach photoshoot while preserving identity':'e.g. Make the suit a deep emerald velvet';}));
+      file.addEventListener('change',()=>{const selected=file.files[0];if(!selected)return;if(previewUrl)URL.revokeObjectURL(previewUrl);previewUrl=URL.createObjectURL(selected);preview.src=previewUrl;preview.hidden=false;dropText.hidden=true;});
+      form.addEventListener('submit',async event=>{event.preventDefault();if(!file.files[0])return;submit.disabled=true;status.textContent=mode==='video'?'Generating video — this can take several minutes…':'Editing image…';try{const data=new FormData();data.append('image',file.files[0]);data.append('prompt',prompt.value);data.append('negative_prompt',negative.value);data.append('aspect_ratio',aspect.value);data.append('quality',quality.value);data.append('mode',mode);const response=await fetch('/api/generate',{method:'POST',body:data});if(!response.ok){const detail=await response.json().catch(()=>({}));throw new Error(detail.detail||'Generation failed.');}const blob=await response.blob();if(resultUrl)URL.revokeObjectURL(resultUrl);resultUrl=URL.createObjectURL(blob);const name=mode==='kontext'?'kontext-result.png':mode==='qwen'?'qwen-identity-result.png':'wan22-result.mp4';const tag=mode==='video'?'<video class="media" controls autoplay loop src="'+resultUrl+'"></video>':'<img class="media" alt="Generated image" src="'+resultUrl+'">';result.innerHTML=tag+'<a class="download" href="'+resultUrl+'" download="'+name+'">Download ↘</a>';status.textContent='Complete.';}catch(error){status.textContent=error.message;}finally{submit.disabled=false;}});
     </script>
   </body>
 </html>
