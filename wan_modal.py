@@ -34,6 +34,31 @@ VIDEO_QUALITY = {
     "standard": (480 * 832, 81, 30),
     "high": (704 * 1280, 121, 40),
 }
+IDENTITY_LOCKS = {
+    "qwen": (
+        "Identity preservation is mandatory. Treat each discernible person in the supplied references as "
+        "a separate identity. Preserve every person's exact facial identity, facial structure, skin tone, "
+        "and distinguishing facial features. If the requested image contains multiple people, retain each "
+        "person's face separately. Do not merge, swap, substitute, redesign, or blend faces. Clothing, "
+        "hairstyle, body styling, pose, scenario, composition, and scene must follow the creative direction."
+    ),
+    "kontext": (
+        "Identity preservation is mandatory. Preserve the source subject's exact facial identity, facial "
+        "structure, skin tone, and distinguishing facial features. Do not create a new face. Clothing, "
+        "hairstyle, body styling, pose, camera framing, and scene must follow the creative direction."
+    ),
+    "video": (
+        "Identity preservation is mandatory. Keep the source subject's exact facial identity, facial "
+        "structure, skin tone, and distinguishing facial features stable throughout every frame. Do not "
+        "morph, swap, or introduce another face. Motion, clothing, hairstyle, body styling, and scene must "
+        "follow the creative direction."
+    ),
+}
+ANATOMY_GUARDRAIL = (
+    "extra limbs, extra arms, extra legs, extra hands, duplicate limbs, duplicate hands, "
+    "extra fingers, fused fingers, missing fingers, malformed hands, malformed feet, "
+    "deformed anatomy, distorted body, unnatural body proportions"
+)
 
 app = modal.App(APP_NAME)
 model_cache = modal.Volume.from_name("motion-studio-model-cache", create_if_missing=True)
@@ -105,7 +130,20 @@ def dimensions_for_aspect(source, aspect_ratio: str, target_area: int, multiple:
     return width, height
 
 
-def output_metadata(filename, media_type, mode, prompt, negative_prompt, aspect_ratio, quality, count):
+def prompt_with_identity_lock(mode: str, creative_prompt: str) -> str:
+    return f"{IDENTITY_LOCKS[mode]}\n\nCreative direction: {creative_prompt.strip()}"
+
+
+def negative_prompt_with_anatomy_guardrail(creative_negative_prompt: str, enabled: bool) -> str:
+    user_negative = creative_negative_prompt.strip()
+    if not enabled:
+        return user_negative or " "
+    return f"{ANATOMY_GUARDRAIL}, {user_negative}" if user_negative else ANATOMY_GUARDRAIL
+
+
+def output_metadata(
+    filename, media_type, mode, prompt, negative_prompt, aspect_ratio, quality, count, anatomy_guardrail
+):
     import json
     from datetime import datetime, timezone
 
@@ -118,6 +156,8 @@ def output_metadata(filename, media_type, mode, prompt, negative_prompt, aspect_
         "aspect_ratio": aspect_ratio,
         "quality": quality,
         "reference_count": count,
+        "identity_lock": True,
+        "anatomy_guardrail": anatomy_guardrail,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     (Path(OUTPUT_PATH) / filename).with_suffix(".json").write_text(
@@ -127,7 +167,8 @@ def output_metadata(filename, media_type, mode, prompt, negative_prompt, aspect_
 
 
 def run_image_generation(
-    image_data: list[bytes], prompt: str, negative_prompt: str, mode: str, aspect_ratio: str, quality: str
+    image_data: list[bytes], prompt: str, negative_prompt: str, mode: str, aspect_ratio: str, quality: str,
+    anatomy_guardrail: bool,
 ) -> dict:
     """Shared image-worker implementation; called inside the selected GPU container."""
     import io
@@ -160,16 +201,19 @@ def run_image_generation(
         image_worker_state.update(mode=mode, pipe=pipe)
 
     pipe = image_worker_state["pipe"]
+    model_prompt = prompt_with_identity_lock(mode, prompt)
+    guarded_negative_prompt = negative_prompt_with_anatomy_guardrail(
+        negative_prompt, anatomy_guardrail
+    )
     area, steps = IMAGE_QUALITY[quality]
     width, height = dimensions_for_aspect(source, aspect_ratio, area, multiple=16)
     unique_id = uuid.uuid4().hex
     if mode == "kontext":
-        cleaned_negative = negative_prompt.strip()
         generated = pipe(
             image=source,
-            prompt=prompt.strip(),
-            negative_prompt=cleaned_negative or None,
-            true_cfg_scale=1.5 if cleaned_negative else 1.0,
+            prompt=model_prompt,
+            negative_prompt=guarded_negative_prompt.strip() or None,
+            true_cfg_scale=1.5 if guarded_negative_prompt.strip() else 1.0,
             width=width,
             height=height,
             guidance_scale=2.5,
@@ -179,8 +223,8 @@ def run_image_generation(
     else:
         generated = pipe(
             image=sources,
-            prompt=prompt.strip(),
-            negative_prompt=negative_prompt.strip() or " ",
+            prompt=model_prompt,
+            negative_prompt=guarded_negative_prompt,
             true_cfg_scale=4.0,
             guidance_scale=1.0,
             width=width,
@@ -191,7 +235,7 @@ def run_image_generation(
         filename = f"qwen-identity-{unique_id}.png"
     generated.save(Path(OUTPUT_PATH) / filename, "PNG")
     metadata = output_metadata(
-        filename, "image/png", mode, prompt, negative_prompt, aspect_ratio, quality, len(sources)
+        filename, "image/png", mode, prompt, negative_prompt, aspect_ratio, quality, len(sources), anatomy_guardrail
     )
     outputs.commit()
     return metadata
@@ -207,10 +251,13 @@ def run_image_generation(
     volumes={HF_CACHE_PATH: model_cache, OUTPUT_PATH: outputs},
 )
 def generate_qwen(
-    image_data: list[bytes], prompt: str, negative_prompt: str, aspect_ratio: str, quality: str
+    image_data: list[bytes], prompt: str, negative_prompt: str, aspect_ratio: str, quality: str,
+    anatomy_guardrail: bool,
 ) -> dict:
     """Identity editing is the sole H100 workload."""
-    return run_image_generation(image_data, prompt, negative_prompt, "qwen", aspect_ratio, quality)
+    return run_image_generation(
+        image_data, prompt, negative_prompt, "qwen", aspect_ratio, quality, anatomy_guardrail
+    )
 
 
 @app.function(
@@ -223,10 +270,13 @@ def generate_qwen(
     volumes={HF_CACHE_PATH: model_cache, OUTPUT_PATH: outputs},
 )
 def generate_kontext(
-    image_data: list[bytes], prompt: str, negative_prompt: str, aspect_ratio: str, quality: str
+    image_data: list[bytes], prompt: str, negative_prompt: str, aspect_ratio: str, quality: str,
+    anatomy_guardrail: bool,
 ) -> dict:
     """Run Kontext economically on L40S with CPU offloading."""
-    return run_image_generation(image_data, prompt, negative_prompt, "kontext", aspect_ratio, quality)
+    return run_image_generation(
+        image_data, prompt, negative_prompt, "kontext", aspect_ratio, quality, anatomy_guardrail
+    )
 
 
 @app.function(
@@ -239,7 +289,8 @@ def generate_kontext(
     volumes={HF_CACHE_PATH: model_cache, OUTPUT_PATH: outputs},
 )
 def generate_video(
-    image_data: bytes, prompt: str, negative_prompt: str, aspect_ratio: str, quality: str
+    image_data: bytes, prompt: str, negative_prompt: str, aspect_ratio: str, quality: str,
+    anatomy_guardrail: bool,
 ) -> dict:
     """Run Wan on the lower-cost GPU worker, isolated from the web service."""
     import io
@@ -250,6 +301,10 @@ def generate_video(
     from PIL import Image
 
     source = Image.open(io.BytesIO(image_data)).convert("RGB")
+    model_prompt = prompt_with_identity_lock("video", prompt)
+    guarded_negative_prompt = negative_prompt_with_anatomy_guardrail(
+        negative_prompt, anatomy_guardrail
+    )
     if video_worker_state["pipe"] is None:
         vae = AutoencoderKLWan.from_pretrained(
             WAN_MODEL_ID, subfolder="vae", torch_dtype=torch.float32
@@ -264,9 +319,8 @@ def generate_video(
     width, height = dimensions_for_aspect(source, aspect_ratio, area, multiple=32)
     frames = video_worker_state["pipe"](
         image=source,
-        prompt=prompt.strip(),
-        negative_prompt=negative_prompt.strip()
-        or "static, flicker, blurry, low quality, subtitles, watermark, deformed, distorted limbs, extra fingers",
+        prompt=model_prompt,
+        negative_prompt=f"{guarded_negative_prompt}, static, flicker, blurry, low quality, subtitles, watermark",
         width=width,
         height=height,
         num_frames=num_frames,
@@ -277,7 +331,7 @@ def generate_video(
     filename = f"wan22-{uuid.uuid4().hex}.mp4"
     export_to_video(frames, str(Path(OUTPUT_PATH) / filename), fps=24)
     metadata = output_metadata(
-        filename, "video/mp4", "video", prompt, negative_prompt, aspect_ratio, quality, 1
+        filename, "video/mp4", "video", prompt, negative_prompt, aspect_ratio, quality, 1, anatomy_guardrail
     )
     outputs.commit()
     return metadata
@@ -349,6 +403,7 @@ def web_app():
         images: list[UploadFile] = File(...),
         prompt: str = Form(...),
         negative_prompt: str = Form(""),
+        anatomy_guardrail: bool = Form(False),
         mode: str = Form(...),
         aspect_ratio: str = Form("source"),
         quality: str = Form("standard"),
@@ -374,6 +429,7 @@ def web_app():
             "job_id": job_id,
             "status": "queued",
             "mode": mode,
+            "anatomy_guardrail": anatomy_guardrail,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         job_path.write_text(json.dumps(job), encoding="utf-8")
@@ -381,15 +437,15 @@ def web_app():
         try:
             if mode == "video":
                 call = await generate_video.spawn.aio(
-                    image_data[0], prompt, negative_prompt, aspect_ratio, quality
+                    image_data[0], prompt, negative_prompt, aspect_ratio, quality, anatomy_guardrail
                 )
             elif mode == "qwen":
                 call = await generate_qwen.spawn.aio(
-                    image_data, prompt, negative_prompt, aspect_ratio, quality
+                    image_data, prompt, negative_prompt, aspect_ratio, quality, anatomy_guardrail
                 )
             else:
                 call = await generate_kontext.spawn.aio(
-                    image_data, prompt, negative_prompt, aspect_ratio, quality
+                    image_data, prompt, negative_prompt, aspect_ratio, quality, anatomy_guardrail
                 )
         except Exception as error:
             job["status"] = "failed"
