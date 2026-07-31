@@ -39,19 +39,25 @@ IDENTITY_LOCKS = {
         "Identity preservation is mandatory. Treat each discernible person in the supplied references as "
         "a separate identity. Preserve every person's exact facial identity, facial structure, skin tone, "
         "and distinguishing facial features. If the requested image contains multiple people, retain each "
-        "person's face separately. Do not merge, swap, substitute, redesign, or blend faces. Clothing, "
-        "hairstyle, body styling, pose, scenario, composition, and scene must follow the creative direction."
+        "person's face separately. Do not merge, swap, substitute, redesign, or blend faces. Preserve the "
+        "reference pose, body position, camera framing, composition, scene, and location by default. Change "
+        "those only when the creative direction explicitly requests a change. Clothing, hairstyle, and body "
+        "styling may follow the creative direction."
     ),
     "kontext": (
         "Identity preservation is mandatory. Preserve the source subject's exact facial identity, facial "
-        "structure, skin tone, and distinguishing facial features. Do not create a new face. Clothing, "
-        "hairstyle, body styling, pose, camera framing, and scene must follow the creative direction."
+        "structure, skin tone, and distinguishing facial features. Do not create a new face. Preserve the "
+        "reference pose, body position, camera framing, composition, scene, and location by default. Change "
+        "those only when the creative direction explicitly requests a change. Clothing, hairstyle, and body "
+        "styling may follow the creative direction."
     ),
     "video": (
         "Identity preservation is mandatory. Keep the source subject's exact facial identity, facial "
         "structure, skin tone, and distinguishing facial features stable throughout every frame. Do not "
-        "morph, swap, or introduce another face. Motion, clothing, hairstyle, body styling, and scene must "
-        "follow the creative direction."
+        "morph, swap, or introduce another face. Preserve the reference pose, camera framing, composition, "
+        "scene, and location by default. Change motion, pose, framing, scene, or location only when the "
+        "creative direction explicitly requests a change. Clothing, hairstyle, and body styling may follow "
+        "the creative direction."
     ),
 }
 ANATOMY_GUARDRAIL = (
