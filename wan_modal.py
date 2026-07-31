@@ -53,6 +53,7 @@ image = (
         "huggingface_hub[hf_xet]>=0.30",
         "imageio>=2.37",
         "imageio-ffmpeg>=0.6",
+        "itsdangerous>=2.2",
         "numpy>=1.26",
         "peft>=0.14",
         "pillow>=10.0",
@@ -200,7 +201,7 @@ def web_app():
 
     @web.post("/api/generate")
     async def generate(
-        image: UploadFile = File(...),
+        images: list[UploadFile] = File(...),
         prompt: str = Form(...),
         negative_prompt: str = Form(""),
         mode: str = Form(...),
@@ -215,13 +216,22 @@ def web_app():
             raise HTTPException(status_code=400, detail="Choose a supported aspect ratio.")
         if quality not in IMAGE_QUALITY:
             raise HTTPException(status_code=400, detail="Choose draft, standard, or high quality.")
-        if image.content_type not in {"image/jpeg", "image/png", "image/webp"}:
-            raise HTTPException(status_code=400, detail="Upload a JPEG, PNG, or WebP image.")
+        if not 1 <= len(images) <= 4:
+            raise HTTPException(status_code=400, detail="Upload between one and four reference images.")
+        for upload in images:
+            if upload.content_type not in {"image/jpeg", "image/png", "image/webp"}:
+                raise HTTPException(status_code=400, detail="Upload JPEG, PNG, or WebP reference images.")
 
         try:
-            source = Image.open(io.BytesIO(await image.read())).convert("RGB")
+            sources = [
+                Image.open(io.BytesIO(await upload.read())).convert("RGB") for upload in images
+            ]
         except Exception as error:
-            raise HTTPException(status_code=400, detail="The uploaded file is not a valid image.") from error
+            raise HTTPException(
+                status_code=400, detail="One of the uploaded files is not a valid image."
+            ) from error
+
+        source = sources[0]
 
         pipe = get_pipeline(mode)
         unique_id = uuid.uuid4().hex
@@ -247,7 +257,8 @@ def web_app():
             area, steps = IMAGE_QUALITY[quality]
             width, height = dimensions_for_aspect(source, aspect_ratio, area, multiple=16)
             edited = pipe(
-                image=source,
+                # Qwen Image Edit Plus natively conditions on all supplied images.
+                image=sources,
                 prompt=prompt.strip(),
                 negative_prompt=negative_prompt.strip() or " ",
                 true_cfg_scale=4.0,
