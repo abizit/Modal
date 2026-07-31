@@ -95,6 +95,7 @@ gpu_image = (
     .apt_install("ffmpeg", "git")
     .pip_install(
         "accelerate>=1.0",
+        "ftfy>=6.3",
         "huggingface_hub[hf_xet]>=0.30",
         "imageio>=2.37",
         "imageio-ffmpeg>=0.6",
