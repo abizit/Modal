@@ -107,6 +107,7 @@ def dimensions_for_aspect(source, aspect_ratio: str, target_area: int, multiple:
 
 def output_metadata(filename, media_type, mode, prompt, negative_prompt, aspect_ratio, quality, count):
     import json
+    from datetime import datetime, timezone
 
     metadata = {
         "filename": filename,
@@ -125,19 +126,10 @@ def output_metadata(filename, media_type, mode, prompt, negative_prompt, aspect_
     return metadata
 
 
-@app.function(
-    image=gpu_image,
-    gpu="H100",
-    timeout=20 * 60,
-    scaledown_window=90,
-    max_containers=1,
-    secrets=[hf_secret],
-    volumes={HF_CACHE_PATH: model_cache, OUTPUT_PATH: outputs},
-)
-def generate_image(
+def run_image_generation(
     image_data: list[bytes], prompt: str, negative_prompt: str, mode: str, aspect_ratio: str, quality: str
 ) -> dict:
-    """Run the high-memory image editors only when a generation is requested."""
+    """Shared image-worker implementation; called inside the selected GPU container."""
     import io
 
     import torch
@@ -160,7 +152,11 @@ def generate_image(
             pipe.load_lora_weights(QWEN_IDENTITY_LORA_ID)
         else:
             raise ValueError(f"Unsupported image mode: {mode}")
-        pipe.to("cuda")
+        if mode == "kontext":
+            # Keep the 12B Kontext pipeline within the L40S's 48 GB VRAM budget.
+            pipe.enable_model_cpu_offload()
+        else:
+            pipe.to("cuda")
         image_worker_state.update(mode=mode, pipe=pipe)
 
     pipe = image_worker_state["pipe"]
@@ -199,6 +195,38 @@ def generate_image(
     )
     outputs.commit()
     return metadata
+
+
+@app.function(
+    image=gpu_image,
+    gpu="H100",
+    timeout=20 * 60,
+    scaledown_window=90,
+    max_containers=1,
+    secrets=[hf_secret],
+    volumes={HF_CACHE_PATH: model_cache, OUTPUT_PATH: outputs},
+)
+def generate_qwen(
+    image_data: list[bytes], prompt: str, negative_prompt: str, aspect_ratio: str, quality: str
+) -> dict:
+    """Identity editing is the sole H100 workload."""
+    return run_image_generation(image_data, prompt, negative_prompt, "qwen", aspect_ratio, quality)
+
+
+@app.function(
+    image=gpu_image,
+    gpu="L40S",
+    timeout=20 * 60,
+    scaledown_window=90,
+    max_containers=1,
+    secrets=[hf_secret],
+    volumes={HF_CACHE_PATH: model_cache, OUTPUT_PATH: outputs},
+)
+def generate_kontext(
+    image_data: list[bytes], prompt: str, negative_prompt: str, aspect_ratio: str, quality: str
+) -> dict:
+    """Run Kontext economically on L40S with CPU offloading."""
+    return run_image_generation(image_data, prompt, negative_prompt, "kontext", aspect_ratio, quality)
 
 
 @app.function(
@@ -340,22 +368,66 @@ def web_app():
                 raise HTTPException(status_code=400, detail="Upload JPEG, PNG, or WebP reference images.")
 
         image_data = [await upload.read() for upload in images]
+        job_id = uuid.uuid4().hex
+        job_path = Path(OUTPUT_PATH) / f"job-{job_id}.json"
+        job = {
+            "job_id": job_id,
+            "status": "queued",
+            "mode": mode,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        job_path.write_text(json.dumps(job), encoding="utf-8")
+        await outputs.commit.aio()
         try:
             if mode == "video":
-                metadata = await generate_video.remote.aio(
+                call = await generate_video.spawn.aio(
                     image_data[0], prompt, negative_prompt, aspect_ratio, quality
                 )
+            elif mode == "qwen":
+                call = await generate_qwen.spawn.aio(
+                    image_data, prompt, negative_prompt, aspect_ratio, quality
+                )
             else:
-                metadata = await generate_image.remote.aio(
-                    image_data, prompt, negative_prompt, mode, aspect_ratio, quality
+                call = await generate_kontext.spawn.aio(
+                    image_data, prompt, negative_prompt, aspect_ratio, quality
                 )
         except Exception as error:
-            print(f"Generation worker failed: {error}")
-            raise HTTPException(status_code=502, detail="Generation worker failed. Check Modal app logs.") from error
+            job["status"] = "failed"
+            job_path.write_text(json.dumps(job), encoding="utf-8")
+            await outputs.commit.aio()
+            raise HTTPException(status_code=502, detail="Could not start the generation worker.") from error
+        job["call_id"] = call.object_id
+        job_path.write_text(json.dumps(job), encoding="utf-8")
+        await outputs.commit.aio()
+        return job
 
+    @web.get("/api/jobs/{job_id}")
+    async def generation_job(job_id: str):
+        if len(job_id) != 32 or any(character not in "0123456789abcdef" for character in job_id):
+            raise HTTPException(status_code=400, detail="That is not a valid generation job.")
+        job_path = Path(OUTPUT_PATH) / f"job-{job_id}.json"
+        if not job_path.is_file():
+            raise HTTPException(status_code=404, detail="Generation job not found.")
+        job = json.loads(job_path.read_text(encoding="utf-8"))
+        if job.get("status") == "failed" or not job.get("call_id"):
+            return job
+        try:
+            metadata = await asyncio.to_thread(
+                modal.FunctionCall.from_id(job["call_id"]).get, timeout=0
+            )
+        except TimeoutError:
+            job["status"] = "running"
+            return job
+        except Exception as error:
+            print(f"Generation job failed: {error}")
+            job["status"] = "failed"
+            return job
         await outputs.reload.aio()
-        output = Path(OUTPUT_PATH) / metadata["filename"]
-        return FileResponse(output, media_type=metadata["media_type"], filename=metadata["filename"])
+        if not (Path(OUTPUT_PATH) / metadata["filename"]).is_file():
+            job["status"] = "running"
+            return job
+        job.update(status="complete", result=metadata)
+        return job
 
     def output_path(filename: str) -> Path:
         if Path(filename).name != filename or not filename.endswith((".png", ".mp4")):
@@ -384,6 +456,17 @@ def web_app():
         output = output_path(filename)
         media_type = "video/mp4" if filename.endswith(".mp4") else "image/png"
         return FileResponse(output, media_type=media_type)
+
+    @web.delete("/api/history/{filename}")
+    async def delete_output(filename: str):
+        """Permanently remove one generated render and its archive record."""
+        output = output_path(filename)
+        output.unlink()
+        metadata = output.with_suffix(".json")
+        if metadata.is_file():
+            metadata.unlink()
+        await outputs.commit.aio()
+        return {"detail": "Generation permanently deleted."}
 
     @web.post("/api/upload-to-mega")
     async def upload_to_mega(filename: str = Form(...)):
