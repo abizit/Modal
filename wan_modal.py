@@ -34,6 +34,27 @@ VIDEO_QUALITY = {
     "standard": (480 * 832, 81, 30),
     "high": (704 * 1280, 121, 40),
 }
+VIDEO_MOTION_MODES = {"subtle", "normal", "major"}
+VIDEO_STABILITY_NEGATIVE = (
+    "static, flicker, blurry, low quality, subtitles, watermark, body morphing, body inflation, "
+    "stretching body, changing body proportions, distorted anatomy, warped limbs, extra limbs, "
+    "duplicate hands, malformed hands, warped face, melted face, sudden pose change, camera jump"
+)
+VIDEO_MOTION_DIRECTIONS = {
+    "subtle": (
+        "Use only subtle, realistic motion such as breathing, a gentle head movement, or a small weight "
+        "shift. Keep the starting pose and body position essentially unchanged."
+    ),
+    "normal": (
+        "Perform the requested motion naturally and continuously. Keep realistic body volume, stable anatomy, "
+        "and consistent proportions throughout the entire clip."
+    ),
+    "major": (
+        "Treat the requested action as one continuous, physically plausible human movement. Use natural joint "
+        "articulation and stable body volume from start to finish. Do not inflate, stretch, melt, duplicate, "
+        "or deform any part of the subject while performing the action."
+    ),
+}
 IDENTITY_LOCKS = {
     "qwen": (
         "Identity preservation is mandatory. Treat each discernible person in the supplied references as "
@@ -149,7 +170,8 @@ def negative_prompt_with_anatomy_guardrail(creative_negative_prompt: str, enable
 
 
 def output_metadata(
-    filename, media_type, mode, prompt, negative_prompt, aspect_ratio, quality, count, anatomy_guardrail
+    filename, media_type, mode, prompt, negative_prompt, aspect_ratio, quality, count, anatomy_guardrail,
+    motion_mode=None,
 ):
     import json
     from datetime import datetime, timezone
@@ -165,6 +187,7 @@ def output_metadata(
         "reference_count": count,
         "identity_lock": True,
         "anatomy_guardrail": anatomy_guardrail,
+        "motion_mode": motion_mode,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     (Path(OUTPUT_PATH) / filename).with_suffix(".json").write_text(
@@ -297,7 +320,7 @@ def generate_kontext(
 )
 def generate_video(
     image_data: bytes, prompt: str, negative_prompt: str, aspect_ratio: str, quality: str,
-    anatomy_guardrail: bool,
+    anatomy_guardrail: bool, motion_mode: str, variation_count: int,
 ) -> dict:
     """Run Wan on the lower-cost GPU worker, isolated from the web service."""
     import io
@@ -308,7 +331,10 @@ def generate_video(
     from PIL import Image
 
     source = Image.open(io.BytesIO(image_data)).convert("RGB")
-    model_prompt = prompt_with_identity_lock("video", prompt)
+    model_prompt = (
+        f"{prompt_with_identity_lock('video', prompt)}\n\n"
+        f"Motion direction: {VIDEO_MOTION_DIRECTIONS[motion_mode]}"
+    )
     guarded_negative_prompt = negative_prompt_with_anatomy_guardrail(
         negative_prompt, anatomy_guardrail
     )
@@ -323,25 +349,33 @@ def generate_video(
         video_worker_state["pipe"] = pipe
 
     area, num_frames, steps = VIDEO_QUALITY[quality]
+    if motion_mode == "major":
+        # Major pose changes benefit from more denoising iterations; cap duration so the model has less
+        # opportunity to drift after completing the action.
+        num_frames = min(num_frames, 81)
+        steps = max(steps, 50)
     width, height = dimensions_for_aspect(source, aspect_ratio, area, multiple=32)
-    frames = video_worker_state["pipe"](
-        image=source,
-        prompt=model_prompt,
-        negative_prompt=f"{guarded_negative_prompt}, static, flicker, blurry, low quality, subtitles, watermark",
-        width=width,
-        height=height,
-        num_frames=num_frames,
-        num_inference_steps=steps,
-        guidance_scale=5.0,
-        generator=torch.Generator(device="cuda").manual_seed(torch.seed()),
-    ).frames[0]
-    filename = f"wan22-{uuid.uuid4().hex}.mp4"
-    export_to_video(frames, str(Path(OUTPUT_PATH) / filename), fps=24)
-    metadata = output_metadata(
-        filename, "video/mp4", "video", prompt, negative_prompt, aspect_ratio, quality, 1, anatomy_guardrail
-    )
+    variants = []
+    for _ in range(variation_count):
+        frames = video_worker_state["pipe"](
+            image=source,
+            prompt=model_prompt,
+            negative_prompt=f"{guarded_negative_prompt}, {VIDEO_STABILITY_NEGATIVE}",
+            width=width,
+            height=height,
+            num_frames=num_frames,
+            num_inference_steps=steps,
+            guidance_scale=5.0,
+            generator=torch.Generator(device="cuda").manual_seed(torch.seed()),
+        ).frames[0]
+        filename = f"wan22-{uuid.uuid4().hex}.mp4"
+        export_to_video(frames, str(Path(OUTPUT_PATH) / filename), fps=24)
+        variants.append(output_metadata(
+            filename, "video/mp4", "video", prompt, negative_prompt, aspect_ratio, quality, 1,
+            anatomy_guardrail, motion_mode
+        ))
     outputs.commit()
-    return metadata
+    return {"primary": variants[0], "variants": variants}
 
 
 @app.function(
@@ -414,6 +448,8 @@ def web_app():
         mode: str = Form(...),
         aspect_ratio: str = Form("source"),
         quality: str = Form("standard"),
+        motion_mode: str = Form("normal"),
+        variation_count: int = Form(1),
     ):
         if mode not in {"kontext", "qwen", "video"}:
             raise HTTPException(status_code=400, detail="Choose Kontext, Qwen, or video mode.")
@@ -423,6 +459,10 @@ def web_app():
             raise HTTPException(status_code=400, detail="Choose a supported aspect ratio.")
         if quality not in IMAGE_QUALITY:
             raise HTTPException(status_code=400, detail="Choose draft, standard, or high quality.")
+        if motion_mode not in VIDEO_MOTION_MODES:
+            raise HTTPException(status_code=400, detail="Choose subtle, normal, or major motion.")
+        if variation_count not in {1, 2, 3}:
+            raise HTTPException(status_code=400, detail="Choose one, two, or three variations.")
         if not 1 <= len(images) <= 4:
             raise HTTPException(status_code=400, detail="Upload between one and four reference images.")
         for upload in images:
@@ -437,6 +477,8 @@ def web_app():
             "status": "queued",
             "mode": mode,
             "anatomy_guardrail": anatomy_guardrail,
+            "motion_mode": motion_mode if mode == "video" else None,
+            "variation_count": variation_count if mode == "video" else 1,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         job_path.write_text(json.dumps(job), encoding="utf-8")
@@ -444,7 +486,8 @@ def web_app():
         try:
             if mode == "video":
                 call = await generate_video.spawn.aio(
-                    image_data[0], prompt, negative_prompt, aspect_ratio, quality, anatomy_guardrail
+                    image_data[0], prompt, negative_prompt, aspect_ratio, quality, anatomy_guardrail,
+                    motion_mode, variation_count,
                 )
             elif mode == "qwen":
                 call = await generate_qwen.spawn.aio(
@@ -486,7 +529,8 @@ def web_app():
             job["status"] = "failed"
             return job
         await outputs.reload.aio()
-        if not (Path(OUTPUT_PATH) / metadata["filename"]).is_file():
+        primary_metadata = metadata.get("primary", metadata)
+        if not (Path(OUTPUT_PATH) / primary_metadata["filename"]).is_file():
             job["status"] = "running"
             return job
         job.update(status="complete", result=metadata)
