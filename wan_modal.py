@@ -43,10 +43,13 @@ hf_secret = modal.Secret.from_name("huggingface-secret", required_keys=["HF_TOKE
 studio_auth_secret = modal.Secret.from_name(
     "studio-auth", required_keys=["APP_USERNAME", "APP_PASSWORD", "APP_SESSION_SECRET"]
 )
+mega_secret = modal.Secret.from_name(
+    "mega-credentials", required_keys=["MEGA_EMAIL", "MEGA_PASSWORD"]
+)
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("ffmpeg", "git")
+    .apt_install("ffmpeg", "git", "nodejs", "npm")
     .pip_install(
         "accelerate>=1.0",
         "fastapi>=0.115",
@@ -64,7 +67,9 @@ image = (
         "transformers>=4.48",
     )
     .pip_install("git+https://github.com/huggingface/diffusers.git")
+    .run_commands("mkdir -p /opt/mega && npm install --prefix /opt/mega megajs@^1.3.0")
     .add_local_file("web_ui.html", remote_path=f"{ASSET_PATH}/index.html")
+    .add_local_file("mega_upload.js", remote_path=f"{ASSET_PATH}/mega_upload.js")
 )
 
 
@@ -89,12 +94,17 @@ def download_models() -> None:
     timeout=20 * 60,
     scaledown_window=10 * 60,
     max_containers=1,
-    secrets=[hf_secret, studio_auth_secret],
+    secrets=[hf_secret, studio_auth_secret, mega_secret],
     volumes={HF_CACHE_PATH: model_cache, OUTPUT_PATH: outputs},
 )
 @modal.asgi_app()
 def web_app():
     """Serve the UI and keep only the currently selected model in memory."""
+    import asyncio
+    import json
+    import subprocess
+    from datetime import datetime, timezone
+
     import torch
     from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
@@ -295,8 +305,72 @@ def web_app():
             export_to_video(frames, str(output), fps=24)
             media_type = "video/mp4"
 
+        metadata = {
+            "filename": filename,
+            "media_type": media_type,
+            "mode": mode,
+            "prompt": prompt.strip(),
+            "negative_prompt": negative_prompt.strip(),
+            "aspect_ratio": aspect_ratio,
+            "quality": quality,
+            "reference_count": len(sources),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        output.with_suffix(".json").write_text(json.dumps(metadata), encoding="utf-8")
         await outputs.commit.aio()
         return FileResponse(output, media_type=media_type, filename=filename)
+
+    def output_path(filename: str) -> Path:
+        if Path(filename).name != filename or not filename.endswith((".png", ".mp4")):
+            raise HTTPException(status_code=400, detail="That is not a valid studio output.")
+        output = Path(OUTPUT_PATH) / filename
+        if not output.is_file():
+            raise HTTPException(status_code=404, detail="The generated file is no longer available.")
+        return output
+
+    @web.get("/api/history")
+    async def generation_history():
+        history = []
+        for metadata_file in Path(OUTPUT_PATH).glob("*.json"):
+            try:
+                entry = json.loads(metadata_file.read_text(encoding="utf-8"))
+                filename = entry.get("filename", "")
+                if output_path(filename).is_file():
+                    history.append(entry)
+            except (json.JSONDecodeError, OSError, HTTPException):
+                continue
+        history.sort(key=lambda entry: entry.get("created_at", ""), reverse=True)
+        return {"items": history[:48]}
+
+    @web.get("/api/output/{filename}")
+    async def get_output(filename: str):
+        output = output_path(filename)
+        media_type = "video/mp4" if filename.endswith(".mp4") else "image/png"
+        return FileResponse(output, media_type=media_type)
+
+    @web.post("/api/upload-to-mega")
+    async def upload_to_mega(filename: str = Form(...)):
+        """Upload a generated output to the private AI generations MEGA folder."""
+        output = output_path(filename)
+        try:
+            completed = await asyncio.to_thread(
+                subprocess.run,
+                ["node", f"{ASSET_PATH}/mega_upload.js", str(output)],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15 * 60,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise HTTPException(status_code=504, detail="Mega upload timed out. Please try again.") from error
+        except subprocess.CalledProcessError as error:
+            diagnostic = (error.stderr or error.stdout or "No diagnostic was returned.").strip()
+            print(f"MEGA upload failed: {diagnostic[-1000:]}")
+            raise HTTPException(
+                status_code=502,
+                detail="Mega upload failed. Open the Modal app logs for the MEGA diagnostic.",
+            ) from error
+        return {"detail": "Uploaded to Mega / AI generations.", "filename": completed.stdout.strip()}
 
     # Register this catch-all mount after API routes.
     web.mount("/", StaticFiles(directory=ASSET_PATH, html=True), name="ui")
