@@ -1,6 +1,5 @@
 """A single-page Modal studio for FLUX.1 Kontext and Wan2.2."""
 
-import io
 import hmac
 import math
 import os
@@ -47,34 +46,41 @@ mega_secret = modal.Secret.from_name(
     "mega-credentials", required_keys=["MEGA_EMAIL", "MEGA_PASSWORD"]
 )
 
-image = (
+web_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("ffmpeg", "git", "nodejs", "npm")
+    .apt_install("nodejs", "npm")
+    .pip_install(
+        "fastapi>=0.115",
+        "itsdangerous>=2.2",
+        "python-multipart>=0.0.20",
+    )
+    .run_commands("mkdir -p /opt/mega && npm install --prefix /opt/mega megajs@^1.3.0")
+    .add_local_file("web_ui.html", remote_path=f"{ASSET_PATH}/index.html")
+    .add_local_file("mega_upload.js", remote_path=f"{ASSET_PATH}/mega_upload.js")
+)
+
+gpu_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("ffmpeg", "git")
     .pip_install(
         "accelerate>=1.0",
-        "fastapi>=0.115",
         "huggingface_hub[hf_xet]>=0.30",
         "imageio>=2.37",
         "imageio-ffmpeg>=0.6",
-        "itsdangerous>=2.2",
         "numpy>=1.26",
         "peft>=0.14",
         "pillow>=10.0",
-        "python-multipart>=0.0.20",
         "safetensors>=0.5",
         "torch>=2.4",
         "torchvision>=0.19",
         "transformers>=4.48",
     )
     .pip_install("git+https://github.com/huggingface/diffusers.git")
-    .run_commands("mkdir -p /opt/mega && npm install --prefix /opt/mega megajs@^1.3.0")
-    .add_local_file("web_ui.html", remote_path=f"{ASSET_PATH}/index.html")
-    .add_local_file("mega_upload.js", remote_path=f"{ASSET_PATH}/mega_upload.js")
 )
 
 
 @app.function(
-    image=image,
+    image=gpu_image,
     secrets=[hf_secret],
     volumes={HF_CACHE_PATH: model_cache},
     timeout=60 * 60,
@@ -88,14 +94,172 @@ def download_models() -> None:
     model_cache.commit()
 
 
+image_worker_state: dict[str, object | None] = {"mode": None, "pipe": None}
+video_worker_state: dict[str, object | None] = {"pipe": None}
+
+
+def dimensions_for_aspect(source, aspect_ratio: str, target_area: int, multiple: int) -> tuple[int, int]:
+    aspect = ASPECT_RATIOS[aspect_ratio] or source.width / source.height
+    width = max(multiple, round(math.sqrt(target_area * aspect) / multiple) * multiple)
+    height = max(multiple, round(math.sqrt(target_area / aspect) / multiple) * multiple)
+    return width, height
+
+
+def output_metadata(filename, media_type, mode, prompt, negative_prompt, aspect_ratio, quality, count):
+    import json
+
+    metadata = {
+        "filename": filename,
+        "media_type": media_type,
+        "mode": mode,
+        "prompt": prompt.strip(),
+        "negative_prompt": negative_prompt.strip(),
+        "aspect_ratio": aspect_ratio,
+        "quality": quality,
+        "reference_count": count,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    (Path(OUTPUT_PATH) / filename).with_suffix(".json").write_text(
+        json.dumps(metadata), encoding="utf-8"
+    )
+    return metadata
+
+
 @app.function(
-    image=image,
+    image=gpu_image,
     gpu="H100",
     timeout=20 * 60,
-    scaledown_window=10 * 60,
+    scaledown_window=90,
     max_containers=1,
-    secrets=[hf_secret, studio_auth_secret, mega_secret],
+    secrets=[hf_secret],
     volumes={HF_CACHE_PATH: model_cache, OUTPUT_PATH: outputs},
+)
+def generate_image(
+    image_data: list[bytes], prompt: str, negative_prompt: str, mode: str, aspect_ratio: str, quality: str
+) -> dict:
+    """Run the high-memory image editors only when a generation is requested."""
+    import io
+
+    import torch
+    from PIL import Image
+
+    sources = [Image.open(io.BytesIO(data)).convert("RGB") for data in image_data]
+    source = sources[0]
+    if image_worker_state["mode"] != mode:
+        if image_worker_state["pipe"] is not None:
+            del image_worker_state["pipe"]
+            torch.cuda.empty_cache()
+        if mode == "kontext":
+            from diffusers import FluxKontextPipeline
+
+            pipe = FluxKontextPipeline.from_pretrained(FLUX_MODEL_ID, torch_dtype=torch.bfloat16)
+        elif mode == "qwen":
+            from diffusers import QwenImageEditPlusPipeline
+
+            pipe = QwenImageEditPlusPipeline.from_pretrained(QWEN_MODEL_ID, torch_dtype=torch.bfloat16)
+            pipe.load_lora_weights(QWEN_IDENTITY_LORA_ID)
+        else:
+            raise ValueError(f"Unsupported image mode: {mode}")
+        pipe.to("cuda")
+        image_worker_state.update(mode=mode, pipe=pipe)
+
+    pipe = image_worker_state["pipe"]
+    area, steps = IMAGE_QUALITY[quality]
+    width, height = dimensions_for_aspect(source, aspect_ratio, area, multiple=16)
+    unique_id = uuid.uuid4().hex
+    if mode == "kontext":
+        cleaned_negative = negative_prompt.strip()
+        generated = pipe(
+            image=source,
+            prompt=prompt.strip(),
+            negative_prompt=cleaned_negative or None,
+            true_cfg_scale=1.5 if cleaned_negative else 1.0,
+            width=width,
+            height=height,
+            guidance_scale=2.5,
+            num_inference_steps=steps,
+        ).images[0]
+        filename = f"kontext-{unique_id}.png"
+    else:
+        generated = pipe(
+            image=sources,
+            prompt=prompt.strip(),
+            negative_prompt=negative_prompt.strip() or " ",
+            true_cfg_scale=4.0,
+            guidance_scale=1.0,
+            width=width,
+            height=height,
+            num_inference_steps=steps,
+            generator=torch.Generator(device="cuda").manual_seed(torch.seed()),
+        ).images[0]
+        filename = f"qwen-identity-{unique_id}.png"
+    generated.save(Path(OUTPUT_PATH) / filename, "PNG")
+    metadata = output_metadata(
+        filename, "image/png", mode, prompt, negative_prompt, aspect_ratio, quality, len(sources)
+    )
+    outputs.commit()
+    return metadata
+
+
+@app.function(
+    image=gpu_image,
+    gpu="L40S",
+    timeout=20 * 60,
+    scaledown_window=90,
+    max_containers=1,
+    secrets=[hf_secret],
+    volumes={HF_CACHE_PATH: model_cache, OUTPUT_PATH: outputs},
+)
+def generate_video(
+    image_data: bytes, prompt: str, negative_prompt: str, aspect_ratio: str, quality: str
+) -> dict:
+    """Run Wan on the lower-cost GPU worker, isolated from the web service."""
+    import io
+
+    import torch
+    from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
+    from diffusers.utils import export_to_video
+    from PIL import Image
+
+    source = Image.open(io.BytesIO(image_data)).convert("RGB")
+    if video_worker_state["pipe"] is None:
+        vae = AutoencoderKLWan.from_pretrained(
+            WAN_MODEL_ID, subfolder="vae", torch_dtype=torch.float32
+        )
+        pipe = WanImageToVideoPipeline.from_pretrained(
+            WAN_MODEL_ID, vae=vae, torch_dtype=torch.bfloat16
+        )
+        pipe.enable_model_cpu_offload()
+        video_worker_state["pipe"] = pipe
+
+    area, num_frames, steps = VIDEO_QUALITY[quality]
+    width, height = dimensions_for_aspect(source, aspect_ratio, area, multiple=32)
+    frames = video_worker_state["pipe"](
+        image=source,
+        prompt=prompt.strip(),
+        negative_prompt=negative_prompt.strip()
+        or "static, flicker, blurry, low quality, subtitles, watermark, deformed, distorted limbs, extra fingers",
+        width=width,
+        height=height,
+        num_frames=num_frames,
+        num_inference_steps=steps,
+        guidance_scale=5.0,
+        generator=torch.Generator(device="cuda").manual_seed(torch.seed()),
+    ).frames[0]
+    filename = f"wan22-{uuid.uuid4().hex}.mp4"
+    export_to_video(frames, str(Path(OUTPUT_PATH) / filename), fps=24)
+    metadata = output_metadata(
+        filename, "video/mp4", "video", prompt, negative_prompt, aspect_ratio, quality, 1
+    )
+    outputs.commit()
+    return metadata
+
+
+@app.function(
+    image=web_image,
+    max_containers=1,
+    secrets=[studio_auth_secret, mega_secret],
+    volumes={OUTPUT_PATH: outputs},
 )
 @modal.asgi_app()
 def web_app():
@@ -105,16 +269,12 @@ def web_app():
     import subprocess
     from datetime import datetime, timezone
 
-    import torch
     from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
     from fastapi.staticfiles import StaticFiles
-    from PIL import Image
     from starlette.middleware.sessions import SessionMiddleware
 
     web = FastAPI(title="Motion & Kontext Studio")
-    state: dict[str, object | None] = {"mode": None, "pipe": None}
-
     @web.middleware("http")
     async def require_login(request: Request, call_next):
         if request.url.path == "/login":
@@ -156,59 +316,6 @@ def web_app():
         request.session.clear()
         return RedirectResponse(url="/login", status_code=303)
 
-    def unload_pipeline() -> None:
-        if state["pipe"] is not None:
-            del state["pipe"]
-            state["pipe"] = None
-            state["mode"] = None
-            torch.cuda.empty_cache()
-
-    def get_pipeline(mode: str):
-        if state["mode"] == mode:
-            return state["pipe"]
-        unload_pipeline()
-        if mode == "kontext":
-            from diffusers import FluxKontextPipeline
-
-            pipe = FluxKontextPipeline.from_pretrained(
-                FLUX_MODEL_ID, torch_dtype=torch.bfloat16
-            )
-        elif mode == "qwen":
-            from diffusers import QwenImageEditPlusPipeline
-
-            pipe = QwenImageEditPlusPipeline.from_pretrained(
-                QWEN_MODEL_ID, torch_dtype=torch.bfloat16
-            )
-            pipe.load_lora_weights(QWEN_IDENTITY_LORA_ID)
-        elif mode == "video":
-            from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
-
-            vae = AutoencoderKLWan.from_pretrained(
-                WAN_MODEL_ID, subfolder="vae", torch_dtype=torch.float32
-            )
-            pipe = WanImageToVideoPipeline.from_pretrained(
-                WAN_MODEL_ID, vae=vae, torch_dtype=torch.bfloat16
-            )
-        else:  # guarded by the route, kept for direct-call safety
-            raise ValueError(f"Unsupported mode: {mode}")
-        # The H100 has enough VRAM for the image editors; Wan benefits from
-        # offload because its video decoder has a larger temporary memory peak.
-        if mode == "video":
-            pipe.enable_model_cpu_offload()
-        else:
-            pipe.to("cuda")
-        state["mode"] = mode
-        state["pipe"] = pipe
-        return pipe
-
-    def dimensions_for_aspect(
-        source: Image.Image, aspect_ratio: str, target_area: int, multiple: int
-    ) -> tuple[int, int]:
-        aspect = ASPECT_RATIOS[aspect_ratio] or source.width / source.height
-        width = max(multiple, round(math.sqrt(target_area * aspect) / multiple) * multiple)
-        height = max(multiple, round(math.sqrt(target_area / aspect) / multiple) * multiple)
-        return width, height
-
     @web.post("/api/generate")
     async def generate(
         images: list[UploadFile] = File(...),
@@ -232,93 +339,23 @@ def web_app():
             if upload.content_type not in {"image/jpeg", "image/png", "image/webp"}:
                 raise HTTPException(status_code=400, detail="Upload JPEG, PNG, or WebP reference images.")
 
+        image_data = [await upload.read() for upload in images]
         try:
-            sources = [
-                Image.open(io.BytesIO(await upload.read())).convert("RGB") for upload in images
-            ]
+            if mode == "video":
+                metadata = await generate_video.remote.aio(
+                    image_data[0], prompt, negative_prompt, aspect_ratio, quality
+                )
+            else:
+                metadata = await generate_image.remote.aio(
+                    image_data, prompt, negative_prompt, mode, aspect_ratio, quality
+                )
         except Exception as error:
-            raise HTTPException(
-                status_code=400, detail="One of the uploaded files is not a valid image."
-            ) from error
+            print(f"Generation worker failed: {error}")
+            raise HTTPException(status_code=502, detail="Generation worker failed. Check Modal app logs.") from error
 
-        source = sources[0]
-
-        pipe = get_pipeline(mode)
-        unique_id = uuid.uuid4().hex
-        if mode == "kontext":
-            area, steps = IMAGE_QUALITY[quality]
-            width, height = dimensions_for_aspect(source, aspect_ratio, area, multiple=16)
-            flux_negative_prompt = negative_prompt.strip()
-            edited = pipe(
-                image=source,
-                prompt=prompt.strip(),
-                negative_prompt=flux_negative_prompt or None,
-                true_cfg_scale=1.5 if flux_negative_prompt else 1.0,
-                width=width,
-                height=height,
-                guidance_scale=2.5,
-                num_inference_steps=steps,
-            ).images[0]
-            filename = f"kontext-{unique_id}.png"
-            output = Path(OUTPUT_PATH) / filename
-            edited.save(output, "PNG")
-            media_type = "image/png"
-        elif mode == "qwen":
-            area, steps = IMAGE_QUALITY[quality]
-            width, height = dimensions_for_aspect(source, aspect_ratio, area, multiple=16)
-            edited = pipe(
-                # Qwen Image Edit Plus natively conditions on all supplied images.
-                image=sources,
-                prompt=prompt.strip(),
-                negative_prompt=negative_prompt.strip() or " ",
-                true_cfg_scale=4.0,
-                guidance_scale=1.0,
-                width=width,
-                height=height,
-                num_inference_steps=steps,
-                generator=torch.Generator(device="cuda").manual_seed(torch.seed()),
-            ).images[0]
-            filename = f"qwen-identity-{unique_id}.png"
-            output = Path(OUTPUT_PATH) / filename
-            edited.save(output, "PNG")
-            media_type = "image/png"
-        else:
-            from diffusers.utils import export_to_video
-
-            area, num_frames, steps = VIDEO_QUALITY[quality]
-            width, height = dimensions_for_aspect(source, aspect_ratio, area, multiple=32)
-            frames = pipe(
-                image=source,
-                prompt=prompt.strip(),
-                negative_prompt=negative_prompt.strip()
-                or "static, flicker, blurry, low quality, subtitles, watermark, "
-                "deformed, distorted limbs, extra fingers",
-                width=width,
-                height=height,
-                num_frames=num_frames,
-                num_inference_steps=steps,
-                guidance_scale=5.0,
-                generator=torch.Generator(device="cuda").manual_seed(torch.seed()),
-            ).frames[0]
-            filename = f"wan22-{unique_id}.mp4"
-            output = Path(OUTPUT_PATH) / filename
-            export_to_video(frames, str(output), fps=24)
-            media_type = "video/mp4"
-
-        metadata = {
-            "filename": filename,
-            "media_type": media_type,
-            "mode": mode,
-            "prompt": prompt.strip(),
-            "negative_prompt": negative_prompt.strip(),
-            "aspect_ratio": aspect_ratio,
-            "quality": quality,
-            "reference_count": len(sources),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        output.with_suffix(".json").write_text(json.dumps(metadata), encoding="utf-8")
-        await outputs.commit.aio()
-        return FileResponse(output, media_type=media_type, filename=filename)
+        await outputs.reload.aio()
+        output = Path(OUTPUT_PATH) / metadata["filename"]
+        return FileResponse(output, media_type=metadata["media_type"], filename=metadata["filename"])
 
     def output_path(filename: str) -> Path:
         if Path(filename).name != filename or not filename.endswith((".png", ".mp4")):
