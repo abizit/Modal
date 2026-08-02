@@ -4,6 +4,7 @@
 
 ### Studio capabilities
 
+- Added Qwen-only NSFW adapter controls, configurable LoRA specifications, and an optional realism refinement pass. SFW Qwen requests now run without optional adapters.
 - Archive cards now load compact JPEG thumbnails instead of full-size renders. Archive actions still use the original PNG or MP4; older saved renders receive a thumbnail automatically on first preview.
 
 - Built a private Modal-hosted studio for:
