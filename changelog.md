@@ -4,6 +4,8 @@
 
 ### Studio capabilities
 
+- Archive cards now load compact JPEG thumbnails instead of full-size renders. Archive actions still use the original PNG or MP4; older saved renders receive a thumbnail automatically on first preview.
+
 - Built a private Modal-hosted studio for:
   - FLUX.1 Kontext image editing.
   - Qwen Image Edit Plus identity-oriented image editing with the configured LoRA.

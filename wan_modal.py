@@ -100,10 +100,11 @@ mega_secret = modal.Secret.from_name(
 
 web_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("nodejs", "npm")
+    .apt_install("ffmpeg", "nodejs", "npm")
     .pip_install(
         "fastapi>=0.115",
         "itsdangerous>=2.2",
+        "pillow>=10.0",
         "python-multipart>=0.0.20",
     )
     .run_commands("mkdir -p /opt/mega && npm install --prefix /opt/mega megajs@^1.3.0")
@@ -196,6 +197,31 @@ def output_metadata(
     return metadata
 
 
+def thumbnail_path_for(output: Path) -> Path:
+    """Keep the lightweight Archive preview beside its original render."""
+    return output.with_suffix(".thumb.jpg")
+
+
+def create_image_thumbnail(source, destination: Path) -> None:
+    """Save a compact JPEG preview without changing the original render."""
+    from PIL import Image, ImageOps
+
+    with Image.open(source) as image:
+        preview = ImageOps.exif_transpose(image).convert("RGB")
+        preview.thumbnail((480, 480), Image.Resampling.LANCZOS)
+        preview.save(destination, "JPEG", quality=82, optimize=True)
+
+
+def create_video_thumbnail(frames, destination: Path) -> None:
+    """Use the first generated frame as the Archive preview for a video."""
+    from PIL import Image
+
+    first_frame = frames[0]
+    preview = first_frame.convert("RGB") if isinstance(first_frame, Image.Image) else Image.fromarray(first_frame).convert("RGB")
+    preview.thumbnail((480, 480), Image.Resampling.LANCZOS)
+    preview.save(destination, "JPEG", quality=82, optimize=True)
+
+
 def run_image_generation(
     image_data: list[bytes], prompt: str, negative_prompt: str, mode: str, aspect_ratio: str, quality: str,
     anatomy_guardrail: bool,
@@ -264,6 +290,7 @@ def run_image_generation(
         ).images[0]
         filename = f"qwen-identity-{unique_id}.png"
     generated.save(Path(OUTPUT_PATH) / filename, "PNG")
+    create_image_thumbnail(Path(OUTPUT_PATH) / filename, thumbnail_path_for(Path(OUTPUT_PATH) / filename))
     metadata = output_metadata(
         filename, "image/png", mode, prompt, negative_prompt, aspect_ratio, quality, len(sources), anatomy_guardrail
     )
@@ -370,6 +397,7 @@ def generate_video(
         ).frames[0]
         filename = f"wan22-{uuid.uuid4().hex}.mp4"
         export_to_video(frames, str(Path(OUTPUT_PATH) / filename), fps=24)
+        create_video_thumbnail(frames, thumbnail_path_for(Path(OUTPUT_PATH) / filename))
         variants.append(output_metadata(
             filename, "video/mp4", "video", prompt, negative_prompt, aspect_ratio, quality, 1,
             anatomy_guardrail, motion_mode
@@ -544,6 +572,27 @@ def web_app():
             raise HTTPException(status_code=404, detail="The generated file is no longer available.")
         return output
 
+    def thumbnail_path(filename: str) -> Path:
+        return thumbnail_path_for(output_path(filename))
+
+    def create_legacy_thumbnail(output: Path) -> Path:
+        """Backfill previews for renders saved before Archive thumbnails existed."""
+        preview = thumbnail_path_for(output)
+        if preview.is_file():
+            return preview
+        if output.suffix == ".png":
+            create_image_thumbnail(output, preview)
+        else:
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-ss", "0", "-i", str(output), "-frames:v", "1",
+                    "-vf", "scale=480:480:force_original_aspect_ratio=decrease", "-q:v", "4", str(preview),
+                ],
+                check=True,
+                capture_output=True,
+            )
+        return preview
+
     @web.get("/api/history")
     async def generation_history():
         history = []
@@ -564,11 +613,26 @@ def web_app():
         media_type = "video/mp4" if filename.endswith(".mp4") else "image/png"
         return FileResponse(output, media_type=media_type)
 
+    @web.get("/api/thumbnail/{filename}")
+    async def get_thumbnail(filename: str):
+        output = output_path(filename)
+        preview = thumbnail_path(filename)
+        if not preview.is_file():
+            try:
+                preview = await asyncio.to_thread(create_legacy_thumbnail, output)
+                await outputs.commit.aio()
+            except Exception as error:
+                raise HTTPException(status_code=500, detail="Could not prepare the archive thumbnail.") from error
+        return FileResponse(preview, media_type="image/jpeg")
+
     @web.delete("/api/history/{filename}")
     async def delete_output(filename: str):
         """Permanently remove one generated render and its archive record."""
         output = output_path(filename)
         output.unlink()
+        preview = thumbnail_path_for(output)
+        if preview.is_file():
+            preview.unlink()
         metadata = output.with_suffix(".json")
         if metadata.is_file():
             metadata.unlink()
