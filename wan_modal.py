@@ -551,23 +551,33 @@ def generate_realvis_nsfw_final(
 
     if nsfw_final_worker_state["pipe"] is None:
         from diffusers import StableDiffusionXLImg2ImgPipeline
+        from transformers import CLIPVisionModelWithProjection
 
         model_id = configured_nsfw_final_model_id()
         model_file = configured_nsfw_final_model_file()
+        face_adapter_id = configured_nsfw_face_adapter_id()
         print(f"Loading RealVisXL NSFW finalizer from {model_id}.")
+        # The Plus Face SDXL checkpoint requires the ViT-H image encoder. Letting the generic loader
+        # infer an encoder produces 1664-dimensional image embeddings for an adapter expecting 1280.
+        image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+            face_adapter_id,
+            subfolder="models/image_encoder",
+            torch_dtype=torch.float16,
+            cache_dir=HF_CACHE_PATH,
+        )
         if model_file:
             checkpoint_path = hf_hub_download(
                 model_id, filename=model_file, cache_dir=HF_CACHE_PATH, token=True
             )
             pipe = StableDiffusionXLImg2ImgPipeline.from_single_file(
-                checkpoint_path, torch_dtype=torch.float16
+                checkpoint_path, image_encoder=image_encoder, torch_dtype=torch.float16
             )
         else:
             pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-                model_id, torch_dtype=torch.float16, cache_dir=HF_CACHE_PATH
+                model_id, image_encoder=image_encoder, torch_dtype=torch.float16, cache_dir=HF_CACHE_PATH
             )
         pipe.load_ip_adapter(
-            configured_nsfw_face_adapter_id(),
+            face_adapter_id,
             subfolder=configured_nsfw_face_adapter_subfolder(),
             weight_name=configured_nsfw_face_adapter_weight(),
             cache_dir=HF_CACHE_PATH,
