@@ -55,6 +55,23 @@ modal secret create qwen-adapter-config \
 
 Replace the example realism source and filename with an actual Qwen Image Edit-compatible LoRA. A merged ComfyUI AIO checkpoint is not a Diffusers LoRA and needs a separate worker; do not place it in these settings.
 
+## RealVisXL NSFW final pass
+
+For the strongest identity retention with explicit finishing, select **RealVisXL final pass — recommended** after enabling NSFW. The app first creates an identity-locked draft with base Qwen on the H100, then releases the H100 and sends that draft to an L40S RealVisXL img2img pass. The finalizer uses the first reference image through SDXL IP-Adapter Plus Face conditioning and defaults to a conservative `0.32` denoise value.
+
+The default final model is `SG161222/RealVisXL_V5.0`, which is a Diffusers-format SDXL repository. Set `NSFW_FINAL_MODEL_FILE` only when you intentionally use a single-file SDXL checkpoint; otherwise leave it unset. Override the model in the existing `qwen-adapter-config` secret if you use another compatible SDXL checkpoint:
+
+```bash
+modal secret create qwen-adapter-config \
+  'QWEN_NSFW_LORA_SPECS=[{"source":"ScottzillaSystems/qwen-image-edit-plus-nsfw-lora","strength":1.0}]' \
+  'NSFW_FINAL_MODEL_ID=SG161222/RealVisXL_V5.0' \
+  'NSFW_FINAL_LORA_SPECS=[{"source":"your-org/your-sdxl-nsfw-lora","weight_name":"adapter.safetensors","strength":0.8}]'
+```
+
+`NSFW_FINAL_LORA_SPECS` uses the same JSON format as the Qwen list, but every listed adapter must be SDXL-compatible. Do not reuse a Qwen LoRA here. The final LoRA list is optional: without it, RealVisXL still runs as a face-conditioned, low-denoise photoreal finalizer. The default face adapter is `h94/IP-Adapter`, `sdxl_models/ip-adapter-plus-face_sdxl_vit-h.safetensors`; advanced replacements can be set through `NSFW_FINAL_FACE_ADAPTER_ID`, `NSFW_FINAL_FACE_ADAPTER_SUBFOLDER`, and `NSFW_FINAL_FACE_ADAPTER_WEIGHT`. Re-run `modal run wan_modal.py::download_models` after changing the final model or face adapter, and `modal run wan_modal.py::download_adapters` after changing final LoRAs.
+
+For the final pass, reference 01 is the face-conditioning portrait; Qwen continues to use all supplied references in its first step. Start with final denoise `0.30–0.35` and avoid values above `0.45` when identity is important. Use only lawful images of consenting adults.
+
 ## Notes
 
 - The studio loads only the selected model into the GPU worker at a time, avoiding the cost of keeping both models resident.

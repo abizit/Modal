@@ -72,3 +72,7 @@
   - `12c984c` — multi-reference generation workflow.
   - `9d72ffb` — authenticated Modal generation studio.
 - Pushing to `origin` is still pending confirmation that `github.com:abizit/Modal.git` is an authorized destination.
+# Add RealVisXL face-conditioned NSFW final pass
+
+- Keep Qwen's multi-reference identity edit on the H100, then optionally run a conservative RealVisXL SDXL img2img finalizer on the L40S.
+- Add IP-Adapter Plus Face conditioning, configurable SDXL final LoRAs, final denoise controls, and job/archive metadata for the new path.

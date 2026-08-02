@@ -15,6 +15,11 @@ WAN_MODEL_ID = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
 FLUX_MODEL_ID = "black-forest-labs/FLUX.1-Kontext-dev"
 QWEN_MODEL_ID = "Qwen/Qwen-Image-Edit-2511"
 DEFAULT_NSFW_LORA_ID = "ScottzillaSystems/qwen-image-edit-plus-nsfw-lora"
+DEFAULT_NSFW_FINAL_MODEL_ID = "SG161222/RealVisXL_V5.0"
+DEFAULT_NSFW_FINAL_MODEL_FILE = ""
+DEFAULT_NSFW_FACE_ADAPTER_ID = "h94/IP-Adapter"
+DEFAULT_NSFW_FACE_ADAPTER_SUBFOLDER = "sdxl_models"
+DEFAULT_NSFW_FACE_ADAPTER_WEIGHT = "ip-adapter-plus-face_sdxl_vit-h.safetensors"
 HF_CACHE_PATH = "/root/.cache/huggingface"
 OUTPUT_PATH = "/outputs"
 ADAPTERS_PATH = "/adapters"
@@ -140,7 +145,7 @@ gpu_image = (
 
 @app.function(
     image=gpu_image,
-    secrets=[hf_secret],
+    secrets=[hf_secret, adapter_config_secret],
     volumes={HF_CACHE_PATH: model_cache},
     timeout=60 * 60,
 )
@@ -148,8 +153,9 @@ def download_models() -> None:
     """Preload all model weights into the persistent Modal Volume."""
     from huggingface_hub import snapshot_download
 
-    for model_id in (WAN_MODEL_ID, FLUX_MODEL_ID, QWEN_MODEL_ID):
+    for model_id in (WAN_MODEL_ID, FLUX_MODEL_ID, QWEN_MODEL_ID, configured_nsfw_final_model_id()):
         snapshot_download(model_id, cache_dir=HF_CACHE_PATH, token=True)
+    snapshot_download(configured_nsfw_face_adapter_id(), cache_dir=HF_CACHE_PATH, token=True)
     model_cache.commit()
 
 
@@ -197,6 +203,37 @@ def configured_realism_loras() -> list[dict]:
     return adapter_specs_from_environment("QWEN_REALISM_LORA_SPECS")
 
 
+def configured_nsfw_final_loras() -> list[dict]:
+    """Optional SDXL LoRAs used only by the RealVisXL final pass."""
+    return adapter_specs_from_environment("NSFW_FINAL_LORA_SPECS")
+
+
+def configured_nsfw_final_model_id() -> str:
+    model_id = os.environ.get("NSFW_FINAL_MODEL_ID", DEFAULT_NSFW_FINAL_MODEL_ID).strip()
+    if not model_id or any(character.isspace() for character in model_id):
+        raise ValueError("NSFW_FINAL_MODEL_ID must be a Hugging Face repository ID without whitespace.")
+    return model_id
+
+
+def configured_nsfw_final_model_file() -> str:
+    return os.environ.get("NSFW_FINAL_MODEL_FILE", DEFAULT_NSFW_FINAL_MODEL_FILE).strip()
+
+
+def configured_nsfw_face_adapter_id() -> str:
+    adapter_id = os.environ.get("NSFW_FINAL_FACE_ADAPTER_ID", DEFAULT_NSFW_FACE_ADAPTER_ID).strip()
+    if not adapter_id or any(character.isspace() for character in adapter_id):
+        raise ValueError("NSFW_FINAL_FACE_ADAPTER_ID must be a Hugging Face repository ID without whitespace.")
+    return adapter_id
+
+
+def configured_nsfw_face_adapter_subfolder() -> str:
+    return os.environ.get("NSFW_FINAL_FACE_ADAPTER_SUBFOLDER", DEFAULT_NSFW_FACE_ADAPTER_SUBFOLDER).strip()
+
+
+def configured_nsfw_face_adapter_weight() -> str:
+    return os.environ.get("NSFW_FINAL_FACE_ADAPTER_WEIGHT", DEFAULT_NSFW_FACE_ADAPTER_WEIGHT).strip()
+
+
 def adapter_cache_path(source: str) -> Path:
     return Path(ADAPTERS_PATH) / hashlib.sha256(source.encode("utf-8")).hexdigest()
 
@@ -236,13 +273,14 @@ def resolve_adapter_source(spec: dict) -> str:
     timeout=60 * 60,
 )
 def download_adapters() -> None:
-    """Preload configured Qwen adapters into the persistent adapter Volume."""
-    for spec in configured_nsfw_loras() + configured_realism_loras():
+    """Preload configured Qwen and SDXL adapters into the persistent adapter Volume."""
+    for spec in configured_nsfw_loras() + configured_realism_loras() + configured_nsfw_final_loras():
         resolve_adapter_source(spec)
     adapters.commit()
 
 
 image_worker_state: dict[str, object | None] = {"mode": None, "pipe": None, "loaded_loras": {}}
+nsfw_final_worker_state: dict[str, object | None] = {"pipe": None, "loaded_loras": {}}
 video_worker_state: dict[str, object | None] = {"pipe": None}
 
 
@@ -266,7 +304,7 @@ def negative_prompt_with_anatomy_guardrail(creative_negative_prompt: str, enable
 
 def output_metadata(
     filename, media_type, mode, prompt, negative_prompt, aspect_ratio, quality, count, anatomy_guardrail,
-    motion_mode=None, nsfw_enabled=False, realism_pass=False,
+    motion_mode=None, nsfw_enabled=False, realism_pass=False, nsfw_final_engine=None,
 ):
     import json
     from datetime import datetime, timezone
@@ -285,6 +323,7 @@ def output_metadata(
         "motion_mode": motion_mode,
         "nsfw_enabled": nsfw_enabled,
         "realism_pass": realism_pass,
+        "nsfw_final_engine": nsfw_final_engine,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     (Path(OUTPUT_PATH) / filename).with_suffix(".json").write_text(
@@ -318,13 +357,13 @@ def create_video_thumbnail(frames, destination: Path) -> None:
     preview.save(destination, "JPEG", quality=82, optimize=True)
 
 
-def configure_qwen_loras(pipe, specs: list[dict], strength_multiplier: float = 1.0) -> None:
-    """Load configured adapters once and activate only the adapters requested for this render."""
+def configure_loras(pipe, specs: list[dict], worker_state: dict, label: str, strength_multiplier: float = 1.0) -> None:
+    """Load adapters once and activate only the adapters requested for this render."""
     if not specs:
-        if image_worker_state["loaded_loras"]:
+        if worker_state["loaded_loras"]:
             pipe.disable_lora()
         return
-    loaded_loras = image_worker_state["loaded_loras"]
+    loaded_loras = worker_state["loaded_loras"]
     adapter_names = []
     adapter_weights = []
     for spec in specs:
@@ -336,7 +375,7 @@ def configure_qwen_loras(pipe, specs: list[dict], strength_multiplier: float = 1
             load_options = {"adapter_name": adapter_name}
             if spec["weight_name"]:
                 load_options["weight_name"] = spec["weight_name"]
-            print(f"Loading Qwen LoRA {adapter_name} from {spec['source']}")
+            print(f"Loading {label} LoRA {adapter_name} from {spec['source']}")
             pipe.load_lora_weights(source, **load_options)
             loaded_loras[key] = adapter_name
         adapter_names.append(adapter_name)
@@ -344,10 +383,14 @@ def configure_qwen_loras(pipe, specs: list[dict], strength_multiplier: float = 1
     pipe.set_adapters(adapter_names, adapter_weights=adapter_weights)
 
 
+def configure_qwen_loras(pipe, specs: list[dict], strength_multiplier: float = 1.0) -> None:
+    configure_loras(pipe, specs, image_worker_state, "Qwen", strength_multiplier)
+
+
 def run_image_generation(
     image_data: list[bytes], prompt: str, negative_prompt: str, mode: str, aspect_ratio: str, quality: str,
     anatomy_guardrail: bool, nsfw_enabled: bool = False, nsfw_strength: float = 0.9,
-    realism_pass: bool = False,
+    realism_pass: bool = False, save_intermediate: bool = False,
 ) -> dict:
     """Shared image-worker implementation; called inside the selected GPU container."""
     import io
@@ -440,8 +483,13 @@ def run_image_generation(
         elif nsfw_enabled:
             # Keep future SFW requests free of the prior request's optional adapters.
             configure_qwen_loras(pipe, nsfw_loras, nsfw_strength)
-        filename = f"qwen-identity-{unique_id}.png"
+        filename = f"qwen-draft-{unique_id}.png" if save_intermediate else f"qwen-identity-{unique_id}.png"
     generated.save(Path(OUTPUT_PATH) / filename, "PNG")
+    if save_intermediate:
+        # The L40S finalizer reads this temporary Qwen render from the shared Volume. Do not expose it
+        # as an Archive entry; only the completed final image should appear there.
+        outputs.commit()
+        return {"filename": filename, "width": width, "height": height}
     create_image_thumbnail(Path(OUTPUT_PATH) / filename, thumbnail_path_for(Path(OUTPUT_PATH) / filename))
     metadata = output_metadata(
         filename, "image/png", mode, prompt, negative_prompt, aspect_ratio, quality, len(sources), anatomy_guardrail,
@@ -464,12 +512,125 @@ def run_image_generation(
 def generate_qwen(
     image_data: list[bytes], prompt: str, negative_prompt: str, aspect_ratio: str, quality: str,
     anatomy_guardrail: bool, nsfw_enabled: bool = False, nsfw_strength: float = 0.9,
-    realism_pass: bool = False,
+    realism_pass: bool = False, save_intermediate: bool = False,
 ) -> dict:
     """Identity editing is the sole H100 workload."""
     return run_image_generation(
         image_data, prompt, negative_prompt, "qwen", aspect_ratio, quality, anatomy_guardrail,
-        nsfw_enabled, nsfw_strength, realism_pass,
+        nsfw_enabled, nsfw_strength, realism_pass, save_intermediate,
+    )
+
+
+@app.function(
+    image=gpu_image,
+    gpu="L40S",
+    timeout=20 * 60,
+    scaledown_window=90,
+    max_containers=1,
+    secrets=[hf_secret, adapter_config_secret],
+    volumes={HF_CACHE_PATH: model_cache, OUTPUT_PATH: outputs, ADAPTERS_PATH: adapters},
+)
+def generate_realvis_nsfw_final(
+    qwen_draft_filename: str, identity_image_data: bytes, prompt: str, negative_prompt: str,
+    aspect_ratio: str, quality: str, anatomy_guardrail: bool, nsfw_strength: float,
+    denoise_strength: float, reference_count: int = 1,
+) -> dict:
+    """Finish a Qwen draft on the L40S with RealVisXL and face-conditioned SDXL img2img."""
+    import io
+
+    import torch
+    from huggingface_hub import hf_hub_download
+    from PIL import Image
+
+    outputs.reload()
+    draft_path = Path(OUTPUT_PATH) / qwen_draft_filename
+    if not draft_path.is_file():
+        raise ValueError("The temporary Qwen draft was not available to the NSFW finalizer.")
+    draft = Image.open(draft_path).convert("RGB")
+    identity_image = Image.open(io.BytesIO(identity_image_data)).convert("RGB")
+
+    if nsfw_final_worker_state["pipe"] is None:
+        from diffusers import StableDiffusionXLImg2ImgPipeline
+
+        model_id = configured_nsfw_final_model_id()
+        model_file = configured_nsfw_final_model_file()
+        print(f"Loading RealVisXL NSFW finalizer from {model_id}.")
+        if model_file:
+            checkpoint_path = hf_hub_download(
+                model_id, filename=model_file, cache_dir=HF_CACHE_PATH, token=True
+            )
+            pipe = StableDiffusionXLImg2ImgPipeline.from_single_file(
+                checkpoint_path, torch_dtype=torch.float16
+            )
+        else:
+            pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+                model_id, torch_dtype=torch.float16, cache_dir=HF_CACHE_PATH
+            )
+        pipe.load_ip_adapter(
+            configured_nsfw_face_adapter_id(),
+            subfolder=configured_nsfw_face_adapter_subfolder(),
+            weight_name=configured_nsfw_face_adapter_weight(),
+            cache_dir=HF_CACHE_PATH,
+        )
+        pipe.enable_model_cpu_offload()
+        nsfw_final_worker_state.update(pipe=pipe, loaded_loras={})
+
+    pipe = nsfw_final_worker_state["pipe"]
+    final_loras = configured_nsfw_final_loras()
+    configure_loras(pipe, final_loras, nsfw_final_worker_state, "RealVisXL NSFW", nsfw_strength)
+    pipe.set_ip_adapter_scale(0.85)
+    area, steps = IMAGE_QUALITY[quality]
+    width, height = dimensions_for_aspect(draft, aspect_ratio, area, multiple=8)
+    guarded_negative_prompt = negative_prompt_with_anatomy_guardrail(negative_prompt, anatomy_guardrail)
+    print(
+        "Running RealVisXL face-conditioned NSFW final pass "
+        f"(denoise={denoise_strength:.2f}, adapters={len(final_loras)}, adapter_strength={nsfw_strength:.2f})."
+    )
+    generated = pipe(
+        prompt=(
+            "Preserve the face, facial proportions, skin tone, and distinguishing features of the supplied "
+            "identity portrait. Preserve the Qwen draft's pose, camera framing, composition, and scene. "
+            "Make only the requested adult styling and photorealistic detail changes.\n\n"
+            f"Creative direction: {prompt.strip()}"
+        ),
+        negative_prompt=guarded_negative_prompt.strip() or None,
+        image=draft.resize((width, height), Image.Resampling.LANCZOS),
+        ip_adapter_image=identity_image,
+        strength=denoise_strength,
+        guidance_scale=5.0,
+        num_inference_steps=max(24, min(steps, 32)),
+        generator=torch.Generator(device="cuda").manual_seed(torch.seed()),
+    ).images[0]
+    filename = f"realvisxl-nsfw-{uuid.uuid4().hex}.png"
+    output = Path(OUTPUT_PATH) / filename
+    generated.save(output, "PNG")
+    create_image_thumbnail(output, thumbnail_path_for(output))
+    metadata = output_metadata(
+        filename, "image/png", "qwen", prompt, negative_prompt, aspect_ratio, quality, reference_count,
+        anatomy_guardrail, nsfw_enabled=True, nsfw_final_engine="realvisxl-ip-adapter-face",
+    )
+    # The intermediate is deliberately not archived once its final result exists.
+    draft_path.unlink(missing_ok=True)
+    thumbnail_path_for(draft_path).unlink(missing_ok=True)
+    outputs.commit()
+    return metadata
+
+
+@app.function(timeout=45 * 60, max_containers=1)
+def generate_qwen_with_realvis_final(
+    image_data: list[bytes], prompt: str, negative_prompt: str, aspect_ratio: str, quality: str,
+    anatomy_guardrail: bool, nsfw_strength: float, final_denoise_strength: float,
+) -> dict:
+    """Run Qwen first, release the H100, then finish the same draft on the L40S."""
+    if len(image_data) > 1:
+        print("RealVisXL Face conditioning uses reference 01; Qwen still uses every supplied reference.")
+    qwen_draft = generate_qwen.remote(
+        image_data, prompt, negative_prompt, aspect_ratio, quality, anatomy_guardrail,
+        False, 0.9, False, True,
+    )
+    return generate_realvis_nsfw_final.remote(
+        qwen_draft["filename"], image_data[0], prompt, negative_prompt, aspect_ratio, quality,
+        anatomy_guardrail, nsfw_strength, final_denoise_strength, len(image_data),
     )
 
 
@@ -678,6 +839,8 @@ def web_app():
         variation_count: int = Form(1),
         nsfw_enabled: bool = Form(False),
         nsfw_strength: float = Form(0.9),
+        nsfw_final_engine: str = Form("realvisxl"),
+        nsfw_final_denoise: float = Form(0.32),
         realism_pass: bool = Form(False),
     ):
         if mode not in {"kontext", "qwen", "video"}:
@@ -694,14 +857,25 @@ def web_app():
             raise HTTPException(status_code=400, detail="Choose one, two, or three variations.")
         if not 0 <= nsfw_strength <= 1.5:
             raise HTTPException(status_code=400, detail="Choose an NSFW strength between 0 and 1.5.")
+        if nsfw_final_engine not in {"realvisxl", "qwen"}:
+            raise HTTPException(status_code=400, detail="Choose a supported NSFW rendering path.")
+        if not 0.15 <= nsfw_final_denoise <= 0.55:
+            raise HTTPException(status_code=400, detail="Choose a final-pass denoise strength between 0.15 and 0.55.")
         if mode != "qwen" and (nsfw_enabled or realism_pass):
             raise HTTPException(status_code=400, detail="NSFW and realism controls are available only for Qwen Identity.")
-        if nsfw_enabled:
+        if nsfw_enabled and nsfw_final_engine == "qwen":
             try:
                 configured_nsfw_loras()
             except ValueError as error:
                 raise HTTPException(status_code=400, detail=str(error)) from error
-        if realism_pass:
+        if nsfw_enabled and nsfw_final_engine == "realvisxl":
+            try:
+                configured_nsfw_final_model_id()
+                configured_nsfw_face_adapter_id()
+                configured_nsfw_final_loras()
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+        if realism_pass and nsfw_final_engine == "qwen":
             try:
                 if not configured_realism_loras():
                     raise HTTPException(
@@ -728,7 +902,9 @@ def web_app():
             "variation_count": variation_count if mode == "video" else 1,
             "nsfw_enabled": nsfw_enabled if mode == "qwen" else False,
             "nsfw_strength": nsfw_strength if mode == "qwen" and nsfw_enabled else None,
-            "realism_pass": realism_pass if mode == "qwen" else False,
+            "nsfw_final_engine": nsfw_final_engine if mode == "qwen" and nsfw_enabled else None,
+            "nsfw_final_denoise": nsfw_final_denoise if mode == "qwen" and nsfw_enabled and nsfw_final_engine == "realvisxl" else None,
+            "realism_pass": realism_pass if mode == "qwen" and nsfw_final_engine == "qwen" else False,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         job_path.write_text(json.dumps(job), encoding="utf-8")
@@ -740,10 +916,16 @@ def web_app():
                     motion_mode, variation_count,
                 )
             elif mode == "qwen":
-                call = await generate_qwen.spawn.aio(
-                    image_data, prompt, negative_prompt, aspect_ratio, quality, anatomy_guardrail,
-                    nsfw_enabled, nsfw_strength, realism_pass,
-                )
+                if nsfw_enabled and nsfw_final_engine == "realvisxl":
+                    call = await generate_qwen_with_realvis_final.spawn.aio(
+                        image_data, prompt, negative_prompt, aspect_ratio, quality, anatomy_guardrail,
+                        nsfw_strength, nsfw_final_denoise,
+                    )
+                else:
+                    call = await generate_qwen.spawn.aio(
+                        image_data, prompt, negative_prompt, aspect_ratio, quality, anatomy_guardrail,
+                        nsfw_enabled, nsfw_strength, realism_pass,
+                    )
             else:
                 call = await generate_kontext.spawn.aio(
                     image_data, prompt, negative_prompt, aspect_ratio, quality, anatomy_guardrail
