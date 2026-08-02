@@ -23,6 +23,7 @@ DEFAULT_NSFW_FACE_ADAPTER_WEIGHT = "ip-adapter-plus-face_sdxl_vit-h.safetensors"
 HF_CACHE_PATH = "/root/.cache/huggingface"
 OUTPUT_PATH = "/outputs"
 ADAPTERS_PATH = "/adapters"
+FACE_MODELS_PATH = "/face-models"
 ASSET_PATH = "/assets"
 ASPECT_RATIOS = {
     "source": None,
@@ -99,6 +100,7 @@ app = modal.App(APP_NAME)
 model_cache = modal.Volume.from_name("motion-studio-model-cache", create_if_missing=True)
 outputs = modal.Volume.from_name("motion-studio-outputs", create_if_missing=True)
 adapters = modal.Volume.from_name("motion-studio-adapters", create_if_missing=True)
+face_models = modal.Volume.from_name("motion-studio-face-models", create_if_missing=True)
 hf_secret = modal.Secret.from_name("huggingface-secret", required_keys=["HF_TOKEN"])
 studio_auth_secret = modal.Secret.from_name(
     "studio-auth", required_keys=["APP_USERNAME", "APP_PASSWORD", "APP_SESSION_SECRET"]
@@ -127,11 +129,14 @@ gpu_image = (
     .apt_install("ffmpeg", "git")
     .pip_install(
         "accelerate>=1.0",
+        "insightface>=0.7.3",
         "ftfy>=6.3",
         "huggingface_hub[hf_xet]>=0.30",
         "imageio>=2.37",
         "imageio-ffmpeg>=0.6",
         "numpy>=1.26",
+        "onnxruntime-gpu>=1.20",
+        "opencv-python-headless>=4.10",
         "peft>=0.14",
         "pillow>=10.0",
         "safetensors>=0.5",
@@ -279,6 +284,23 @@ def download_adapters() -> None:
     adapters.commit()
 
 
+@app.function(
+    image=gpu_image,
+    volumes={FACE_MODELS_PATH: face_models},
+    timeout=20 * 60,
+)
+def download_face_models() -> None:
+    """Preload InsightFace detection weights used to protect every face in RealVisXL final passes."""
+    from insightface.app import FaceAnalysis
+
+    print("Downloading InsightFace buffalo_l models for multi-person identity protection.")
+    face_analyser = FaceAnalysis(
+        name="buffalo_l", root=FACE_MODELS_PATH, providers=["CPUExecutionProvider"]
+    )
+    face_analyser.prepare(ctx_id=-1, det_size=(640, 640))
+    face_models.commit()
+
+
 image_worker_state: dict[str, object | None] = {"mode": None, "pipe": None, "loaded_loras": {}}
 nsfw_final_worker_state: dict[str, object | None] = {"pipe": None, "loaded_loras": {}}
 video_worker_state: dict[str, object | None] = {"pipe": None}
@@ -355,6 +377,44 @@ def create_video_thumbnail(frames, destination: Path) -> None:
     preview = first_frame.convert("RGB") if isinstance(first_frame, Image.Image) else Image.fromarray(first_frame).convert("RGB")
     preview.thumbnail((480, 480), Image.Resampling.LANCZOS)
     preview.save(destination, "JPEG", quality=82, optimize=True)
+
+
+def protected_face_mask(image):
+    """Detect faces in the Qwen draft and return a soft head-protection mask for the finalizer."""
+    import cv2
+    import numpy as np
+    from insightface.app import FaceAnalysis
+    from PIL import Image
+
+    face_analyser = nsfw_final_worker_state.get("face_analyser")
+    if face_analyser is None:
+        print("Loading InsightFace detector for multi-person identity protection.")
+        face_analyser = FaceAnalysis(
+            name="buffalo_l",
+            root=FACE_MODELS_PATH,
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+        face_analyser.prepare(ctx_id=0, det_size=(640, 640))
+        nsfw_final_worker_state["face_analyser"] = face_analyser
+        # InsightFace downloads its detection models on first use; retain them for later L40S final passes.
+        face_models.commit()
+
+    rgb = np.asarray(image)
+    faces = face_analyser.get(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    if not faces:
+        raise ValueError(
+            "No face was detected in the Qwen draft, so the multi-person final pass was skipped to avoid identity drift."
+        )
+    mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+    for face in faces:
+        left, top, right, bottom = face.bbox.astype(int)
+        width, height = right - left, bottom - top
+        # Cover facial features, ears, and enough hairline to avoid seams after the final body/detail pass.
+        center = (int((left + right) / 2), int(top + height * 0.38))
+        axes = (max(1, int(width * 0.84)), max(1, int(height * 1.02)))
+        cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=10, sigmaY=10)
+    return Image.fromarray(mask, mode="L"), len(faces)
 
 
 def configure_loras(pipe, specs: list[dict], worker_state: dict, label: str, strength_multiplier: float = 1.0) -> None:
@@ -528,7 +588,7 @@ def generate_qwen(
     scaledown_window=90,
     max_containers=1,
     secrets=[hf_secret, adapter_config_secret],
-    volumes={HF_CACHE_PATH: model_cache, OUTPUT_PATH: outputs, ADAPTERS_PATH: adapters},
+    volumes={HF_CACHE_PATH: model_cache, OUTPUT_PATH: outputs, ADAPTERS_PATH: adapters, FACE_MODELS_PATH: face_models},
 )
 def generate_realvis_nsfw_final(
     qwen_draft_filename: str, identity_image_data: bytes, prompt: str, negative_prompt: str,
@@ -548,6 +608,7 @@ def generate_realvis_nsfw_final(
         raise ValueError("The temporary Qwen draft was not available to the NSFW finalizer.")
     draft = Image.open(draft_path).convert("RGB")
     identity_image = Image.open(io.BytesIO(identity_image_data)).convert("RGB")
+    face_mask, protected_face_count = protected_face_mask(draft)
 
     if nsfw_final_worker_state["pipe"] is None:
         from diffusers import StableDiffusionXLImg2ImgPipeline
@@ -588,29 +649,39 @@ def generate_realvis_nsfw_final(
     pipe = nsfw_final_worker_state["pipe"]
     final_loras = configured_nsfw_final_loras()
     configure_loras(pipe, final_loras, nsfw_final_worker_state, "RealVisXL NSFW", nsfw_strength)
-    pipe.set_ip_adapter_scale(0.85)
     area, steps = IMAGE_QUALITY[quality]
     width, height = dimensions_for_aspect(draft, aspect_ratio, area, multiple=8)
     guarded_negative_prompt = negative_prompt_with_anatomy_guardrail(negative_prompt, anatomy_guardrail)
+    use_single_face_adapter = protected_face_count == 1
+    pipe.set_ip_adapter_scale(0.85 if use_single_face_adapter else 0.0)
+    face_mask = face_mask.resize((width, height), Image.Resampling.LANCZOS)
+    draft_for_final = draft.resize((width, height), Image.Resampling.LANCZOS)
     print(
         "Running RealVisXL face-conditioned NSFW final pass "
-        f"(denoise={denoise_strength:.2f}, adapters={len(final_loras)}, adapter_strength={nsfw_strength:.2f})."
+        f"(denoise={denoise_strength:.2f}, adapters={len(final_loras)}, protected_faces={protected_face_count}, "
+        f"single_face_adapter={use_single_face_adapter})."
     )
-    generated = pipe(
-        prompt=(
+    generation_options = {
+        "prompt": (
             "Preserve the face, facial proportions, skin tone, and distinguishing features of the supplied "
             "identity portrait. Preserve the Qwen draft's pose, camera framing, composition, and scene. "
             "Make only the requested adult styling and photorealistic detail changes.\n\n"
             f"Creative direction: {prompt.strip()}"
         ),
-        negative_prompt=guarded_negative_prompt.strip() or None,
-        image=draft.resize((width, height), Image.Resampling.LANCZOS),
-        ip_adapter_image=identity_image,
-        strength=denoise_strength,
-        guidance_scale=5.0,
-        num_inference_steps=max(24, min(steps, 32)),
-        generator=torch.Generator(device="cuda").manual_seed(torch.seed()),
-    ).images[0]
+        "negative_prompt": guarded_negative_prompt.strip() or None,
+        "image": draft_for_final,
+        "strength": denoise_strength,
+        "guidance_scale": 5.0,
+        "num_inference_steps": max(24, min(steps, 32)),
+        "generator": torch.Generator(device="cuda").manual_seed(torch.seed()),
+    }
+    # Diffusers still expects image embeddings once an IP-Adapter is attached. For multiple people the
+    # adapter scale is zero, so reference 01 is encoded but has no influence on the final pixels.
+    generation_options["ip_adapter_image"] = identity_image
+    generated = pipe(**generation_options).images[0]
+    # For two or more people, restore every detected Qwen face/head region after RealVisXL has refined the
+    # body and scene. A single global face adapter cannot reliably assign two separate reference identities.
+    generated = Image.composite(draft_for_final, generated, face_mask)
     filename = f"realvisxl-nsfw-{uuid.uuid4().hex}.png"
     output = Path(OUTPUT_PATH) / filename
     generated.save(output, "PNG")
@@ -633,7 +704,7 @@ def generate_qwen_with_realvis_final(
 ) -> dict:
     """Run Qwen first, release the H100, then finish the same draft on the L40S."""
     if len(image_data) > 1:
-        print("RealVisXL Face conditioning uses reference 01; Qwen still uses every supplied reference.")
+        print("Qwen uses every reference; RealVisXL will protect every detected face in the Qwen draft.")
     qwen_draft = generate_qwen.remote(
         image_data, prompt, negative_prompt, aspect_ratio, quality, anatomy_guardrail,
         False, 0.9, False, True,

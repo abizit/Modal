@@ -77,3 +77,4 @@
 - Keep Qwen's multi-reference identity edit on the H100, then optionally run a conservative RealVisXL SDXL img2img finalizer on the L40S.
 - Add IP-Adapter Plus Face conditioning, configurable SDXL final LoRAs, final denoise controls, and job/archive metadata for the new path.
 - Explicitly load the adapter's required ViT-H image encoder to keep SDXL face-conditioning embeddings compatible.
+- Protect every detected Qwen face/head region after the RealVisXL pass, preventing a second identity from drifting in two-person renders.
