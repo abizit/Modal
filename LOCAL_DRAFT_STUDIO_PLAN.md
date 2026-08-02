@@ -6,6 +6,26 @@ Run inexpensive image drafts on a 32 GB Apple Silicon MacBook Pro, then use the 
 
 This is intentionally a separate local setup. It must not be merged into, deployed with, or depend on the Modal project.
 
+## Current progress — 2026-08-02
+
+Completed on the MacBook Pro:
+
+- ComfyUI Desktop installed as a standalone app at `/Volumes/Abizit's SSD/AI/ComfyUI`.
+- Apple Silicon was detected; the local installation uses the MPS/Metal-capable ComfyUI Desktop setup.
+- Starter workflows and their model downloads were skipped intentionally.
+- Installed `ComfyUI_photomakerV2_native` by `zhangp3652`; ComfyUI was restarted successfully.
+- Installed `comfyui_controlnet_aux` by `fannovel16`; ComfyUI was restarted successfully.
+- Confirmed that the built-in **Load PhotoMaker Model** node is available on the canvas.
+
+Not yet completed:
+
+- No model weights have been downloaded.
+- No workflow has been assembled or tested.
+
+### Resume here
+
+Download the official `photomaker-v2.bin` file (about 1.8 GB) from [TencentARC/PhotoMaker-V2](https://huggingface.co/TencentARC/PhotoMaker-V2). Leave the filename unchanged and keep it in Downloads temporarily. The next session should move it into ComfyUI's `models/photomaker/` folder, restart or refresh ComfyUI, and select it in the **Load PhotoMaker Model** node.
+
 ## Target workflow
 
 ```text
