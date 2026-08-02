@@ -418,6 +418,8 @@ def web_app():
     import asyncio
     import json
     import subprocess
+    import time
+    from collections import deque
     from datetime import datetime, timezone
 
     from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -426,6 +428,33 @@ def web_app():
     from starlette.middleware.sessions import SessionMiddleware
 
     web = FastAPI(title="Motion & Kontext Studio")
+    login_attempts: dict[str, deque[float]] = {}
+    login_attempt_limit = 5
+    login_attempt_window_seconds = 15 * 60
+
+    def login_attempt_key(request: Request, username: str) -> tuple[str, str]:
+        """Rate-limit both the client and the submitted account name."""
+        client = request.client.host if request.client else "unknown"
+        account = username.strip().casefold()[:128] or "empty"
+        return f"client:{client}", f"account:{account}"
+
+    def prune_login_attempts(now: float) -> None:
+        cutoff = now - login_attempt_window_seconds
+        for key, attempts in list(login_attempts.items()):
+            while attempts and attempts[0] <= cutoff:
+                attempts.popleft()
+            if not attempts:
+                login_attempts.pop(key, None)
+
+    def login_retry_after(keys: tuple[str, str], now: float) -> int | None:
+        prune_login_attempts(now)
+        retry_after = 0
+        for key in keys:
+            attempts = login_attempts.get(key, ())
+            if len(attempts) >= login_attempt_limit:
+                retry_after = max(retry_after, int(login_attempt_window_seconds - (now - attempts[0])) + 1)
+        return retry_after or None
+
     @web.middleware("http")
     async def require_login(request: Request, call_next):
         if request.url.path == "/login":
@@ -454,11 +483,24 @@ def web_app():
 
     @web.post("/login")
     async def login(request: Request, username: str = Form(...), password: str = Form(...)):
+        now = time.monotonic()
+        attempt_keys = login_attempt_key(request, username)
+        retry_after = login_retry_after(attempt_keys, now)
+        if retry_after:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many sign-in attempts. Please try again later.",
+                headers={"Retry-After": str(retry_after)},
+            )
         is_valid = hmac.compare_digest(username, os.environ["APP_USERNAME"]) and hmac.compare_digest(
             password, os.environ["APP_PASSWORD"]
         )
         if not is_valid:
+            for key in attempt_keys:
+                login_attempts.setdefault(key, deque()).append(now)
             return RedirectResponse(url="/login?error=1", status_code=303)
+        for key in attempt_keys:
+            login_attempts.pop(key, None)
         request.session["studio_user"] = username
         return RedirectResponse(url="/", status_code=303)
 
