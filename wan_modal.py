@@ -371,10 +371,21 @@ def create_image_thumbnail(source, destination: Path) -> None:
 
 def create_video_thumbnail(frames, destination: Path) -> None:
     """Use the first generated frame as the Archive preview for a video."""
+    import numpy as np
     from PIL import Image
 
     first_frame = frames[0]
-    preview = first_frame.convert("RGB") if isinstance(first_frame, Image.Image) else Image.fromarray(first_frame).convert("RGB")
+    if isinstance(first_frame, Image.Image):
+        preview = first_frame.convert("RGB")
+    else:
+        frame_array = np.asarray(first_frame)
+        if np.issubdtype(frame_array.dtype, np.floating):
+            # Diffusers may return RGB frames as float32 in either [0, 1] or [0, 255].
+            scale = 255.0 if frame_array.size and frame_array.max() <= 1.0 else 1.0
+            frame_array = np.clip(frame_array * scale, 0, 255).astype(np.uint8)
+        else:
+            frame_array = np.clip(frame_array, 0, 255).astype(np.uint8)
+        preview = Image.fromarray(frame_array).convert("RGB")
     preview.thumbnail((480, 480), Image.Resampling.LANCZOS)
     preview.save(destination, "JPEG", quality=82, optimize=True)
 
