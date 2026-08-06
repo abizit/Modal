@@ -12,6 +12,7 @@ import modal
 
 APP_NAME = "motion-and-kontext-studio"
 WAN_MODEL_ID = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+WAN_HIGH_MOTION_MODEL_ID = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
 FLUX_MODEL_ID = "black-forest-labs/FLUX.1-Kontext-dev"
 QWEN_MODEL_ID = "Qwen/Qwen-Image-Edit-2511"
 DEFAULT_NSFW_LORA_ID = "ScottzillaSystems/qwen-image-edit-plus-nsfw-lora"
@@ -158,7 +159,10 @@ def download_models() -> None:
     """Preload all model weights into the persistent Modal Volume."""
     from huggingface_hub import snapshot_download
 
-    for model_id in (WAN_MODEL_ID, FLUX_MODEL_ID, QWEN_MODEL_ID, configured_nsfw_final_model_id()):
+    for model_id in (
+        WAN_MODEL_ID, WAN_HIGH_MOTION_MODEL_ID, FLUX_MODEL_ID, QWEN_MODEL_ID,
+        configured_nsfw_final_model_id(),
+    ):
         snapshot_download(model_id, cache_dir=HF_CACHE_PATH, token=True)
     snapshot_download(configured_nsfw_face_adapter_id(), cache_dir=HF_CACHE_PATH, token=True)
     model_cache.commit()
@@ -304,6 +308,7 @@ def download_face_models() -> None:
 image_worker_state: dict[str, object | None] = {"mode": None, "pipe": None, "loaded_loras": {}}
 nsfw_final_worker_state: dict[str, object | None] = {"pipe": None, "loaded_loras": {}}
 video_worker_state: dict[str, object | None] = {"pipe": None}
+high_motion_video_worker_state: dict[str, object | None] = {"pipe": None}
 
 
 def dimensions_for_aspect(source, aspect_ratio: str, target_area: int, multiple: int) -> tuple[int, int]:
@@ -326,7 +331,7 @@ def negative_prompt_with_anatomy_guardrail(creative_negative_prompt: str, enable
 
 def output_metadata(
     filename, media_type, mode, prompt, negative_prompt, aspect_ratio, quality, count, anatomy_guardrail,
-    motion_mode=None, nsfw_enabled=False, realism_pass=False, nsfw_final_engine=None,
+    motion_mode=None, nsfw_enabled=False, realism_pass=False, nsfw_final_engine=None, video_engine=None,
 ):
     import json
     from datetime import datetime, timezone
@@ -346,6 +351,7 @@ def output_metadata(
         "nsfw_enabled": nsfw_enabled,
         "realism_pass": realism_pass,
         "nsfw_final_engine": nsfw_final_engine,
+        "video_engine": video_engine,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     (Path(OUTPUT_PATH) / filename).with_suffix(".json").write_text(
@@ -809,7 +815,75 @@ def generate_video(
         create_video_thumbnail(frames, thumbnail_path_for(Path(OUTPUT_PATH) / filename))
         variants.append(output_metadata(
             filename, "video/mp4", "video", prompt, negative_prompt, aspect_ratio, quality, 1,
-            anatomy_guardrail, motion_mode
+            anatomy_guardrail, motion_mode, video_engine="wan5b"
+        ))
+    outputs.commit()
+    return {"primary": variants[0], "variants": variants}
+
+
+@app.function(
+    image=gpu_image,
+    gpu="H100",
+    timeout=30 * 60,
+    scaledown_window=90,
+    max_containers=1,
+    secrets=[hf_secret],
+    volumes={HF_CACHE_PATH: model_cache, OUTPUT_PATH: outputs},
+)
+def generate_high_motion_video(
+    image_data: bytes, prompt: str, negative_prompt: str, aspect_ratio: str, quality: str,
+    anatomy_guardrail: bool, motion_mode: str, variation_count: int,
+) -> dict:
+    """Run the dedicated 14B Wan I2V model on an 80 GB H100 for demanding motion."""
+    import io
+
+    import torch
+    from diffusers import WanImageToVideoPipeline
+    from diffusers.utils import export_to_video
+    from PIL import Image
+
+    source = Image.open(io.BytesIO(image_data)).convert("RGB")
+    model_prompt = (
+        f"{prompt_with_identity_lock('video', prompt)}\n\n"
+        f"Motion direction: {VIDEO_MOTION_DIRECTIONS[motion_mode]}"
+    )
+    guarded_negative_prompt = negative_prompt_with_anatomy_guardrail(
+        negative_prompt, anatomy_guardrail
+    )
+    if high_motion_video_worker_state["pipe"] is None:
+        pipe = WanImageToVideoPipeline.from_pretrained(
+            WAN_HIGH_MOTION_MODEL_ID, torch_dtype=torch.bfloat16
+        )
+        # The upstream I2V-A14B model requires an 80 GB GPU. H100 avoids CPU offload drift and latency.
+        pipe.to("cuda")
+        high_motion_video_worker_state["pipe"] = pipe
+
+    area, num_frames, steps = VIDEO_QUALITY[quality]
+    # The official I2V-A14B recipe uses 81 frames / 40 steps. A shorter clip reduces temporal drift;
+    # major physical actions receive the extra denoising budget.
+    num_frames = min(num_frames, 81)
+    steps = max(steps, 50 if motion_mode == "major" else 40)
+    width, height = dimensions_for_aspect(source, aspect_ratio, area, multiple=32)
+    variants = []
+    for _ in range(variation_count):
+        frames = high_motion_video_worker_state["pipe"](
+            image=source,
+            prompt=model_prompt,
+            negative_prompt=f"{guarded_negative_prompt}, {VIDEO_STABILITY_NEGATIVE}",
+            width=width,
+            height=height,
+            num_frames=num_frames,
+            num_inference_steps=steps,
+            guidance_scale=3.5,
+            generator=torch.Generator(device="cuda").manual_seed(torch.seed()),
+        ).frames[0]
+        filename = f"wan22-i2v14b-{uuid.uuid4().hex}.mp4"
+        output_path = Path(OUTPUT_PATH) / filename
+        export_to_video(frames, str(output_path), fps=16)
+        create_video_thumbnail(frames, thumbnail_path_for(output_path))
+        variants.append(output_metadata(
+            filename, "video/mp4", "video", prompt, negative_prompt, aspect_ratio, quality, 1,
+            anatomy_guardrail, motion_mode, video_engine="wan14b"
         ))
     outputs.commit()
     return {"primary": variants[0], "variants": variants}
@@ -928,6 +1002,7 @@ def web_app():
         aspect_ratio: str = Form("source"),
         quality: str = Form("standard"),
         motion_mode: str = Form("normal"),
+        video_engine: str = Form("wan5b"),
         variation_count: int = Form(1),
         nsfw_enabled: bool = Form(False),
         nsfw_strength: float = Form(0.9),
@@ -945,6 +1020,8 @@ def web_app():
             raise HTTPException(status_code=400, detail="Choose draft, standard, or high quality.")
         if motion_mode not in VIDEO_MOTION_MODES:
             raise HTTPException(status_code=400, detail="Choose subtle, normal, or major motion.")
+        if video_engine not in {"wan5b", "wan14b"}:
+            raise HTTPException(status_code=400, detail="Choose a supported video engine.")
         if variation_count not in {1, 2, 3}:
             raise HTTPException(status_code=400, detail="Choose one, two, or three variations.")
         if not 0 <= nsfw_strength <= 1.5:
@@ -991,6 +1068,7 @@ def web_app():
             "mode": mode,
             "anatomy_guardrail": anatomy_guardrail,
             "motion_mode": motion_mode if mode == "video" else None,
+            "video_engine": video_engine if mode == "video" else None,
             "variation_count": variation_count if mode == "video" else 1,
             "nsfw_enabled": nsfw_enabled if mode == "qwen" else False,
             "nsfw_strength": nsfw_strength if mode == "qwen" and nsfw_enabled else None,
@@ -1003,7 +1081,8 @@ def web_app():
         await outputs.commit.aio()
         try:
             if mode == "video":
-                call = await generate_video.spawn.aio(
+                video_function = generate_high_motion_video if video_engine == "wan14b" else generate_video
+                call = await video_function.spawn.aio(
                     image_data[0], prompt, negative_prompt, aspect_ratio, quality, anatomy_guardrail,
                     motion_mode, variation_count,
                 )
