@@ -72,8 +72,10 @@ IDENTITY_LOCKS = {
         "and distinguishing facial features. If the requested image contains multiple people, retain each "
         "person's face separately. Do not merge, swap, substitute, redesign, or blend faces. Preserve the "
         "reference pose, body position, camera framing, composition, scene, and location by default. Change "
-        "those only when the creative direction explicitly requests a change. Clothing, hairstyle, and body "
-        "styling may follow the creative direction."
+        "those only when the creative direction explicitly requests a change. Clothing, accessories, hairstyle, "
+        "and body styling may follow the creative direction. When a wardrobe or accessory change is requested, "
+        "treat the source clothing and accessories as editable rather than part of the person's identity; create "
+        "one coherent replacement look instead of blending it with the source look."
     ),
     "kontext": (
         "Identity preservation is mandatory. Preserve the source subject's exact facial identity, facial "
@@ -520,6 +522,10 @@ def run_image_generation(
         filename = f"kontext-{unique_id}.png"
     else:
         nsfw_loras = configured_nsfw_loras() if nsfw_enabled else []
+        # The Qwen worker is deliberately warm between requests. Explicitly clear any
+        # LoRAs from an earlier NSFW render before every normal request; otherwise an
+        # SFW outfit edit silently inherits the previous adapter and can produce
+        # unstable identity/detail artifacts.
         configure_qwen_loras(pipe, nsfw_loras, nsfw_strength)
         if nsfw_enabled:
             print(
@@ -557,9 +563,6 @@ def run_image_generation(
                 num_inference_steps=12,
                 generator=torch.Generator(device="cuda").manual_seed(torch.seed()),
             ).images[0]
-        elif nsfw_enabled:
-            # Keep future SFW requests free of the prior request's optional adapters.
-            configure_qwen_loras(pipe, nsfw_loras, nsfw_strength)
         filename = f"qwen-draft-{unique_id}.png" if save_intermediate else f"qwen-identity-{unique_id}.png"
     generated.save(Path(OUTPUT_PATH) / filename, "PNG")
     if save_intermediate:
